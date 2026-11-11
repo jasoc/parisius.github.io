@@ -1,0 +1,26 @@
+<mat-toolbar class="bar">
+  <a class="brand" routerLink="/">parisius<span>.dev</span></a>
+  <span class="spacer"></span>
+  <a mat-button routerLink="/" routerLinkActive="active" [routerLinkActiveOptions]="{ exact: true }">Home</a>
+  <button mat-button [matMenuTriggerFor]="appsMenu">
+    Apps
+    <mat-icon iconPositionEnd>expand_more</mat-icon>
+  </button>
+  <mat-menu #appsMenu="matMenu" xPosition="before">
+    @for (app of apps; track app.path) {
+      <a mat-menu-item [routerLink]="'/' + app.path">
+        <mat-icon>{{ app.icon }}</mat-icon>
+        <span>{{ app.title }}</span>
+      </a>
+    }
+    <mat-divider />
+    <a mat-menu-item routerLink="/apps">
+      <mat-icon>apps</mat-icon>
+      <span>All apps</span>
+    </a>
+  </mat-menu>
+</mat-toolbar>
+
+<main>
+  <router-outlet />
+</main>

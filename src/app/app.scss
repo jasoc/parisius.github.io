@@ -1,0 +1,42 @@
+:host {
+  display: flex;
+  flex-direction: column;
+  height: 100dvh;
+}
+
+.bar {
+  flex: none;
+  height: 48px;
+  padding: 0 12px 0 20px;
+  background: #0b0c0e;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  color: #eceff1;
+  gap: 4px;
+}
+
+.brand {
+  color: inherit;
+  text-decoration: none;
+  font-weight: 500;
+  font-size: 16px;
+  letter-spacing: 0.3px;
+
+  span {
+    color: #78ff78;
+  }
+}
+
+.spacer {
+  flex: 1;
+}
+
+.active {
+  color: #78ff78;
+}
+
+main {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  position: relative;
+}

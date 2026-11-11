@@ -1,0 +1,770 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nuke Sim 3D</title>
+<script src="https://cdn.jsdelivr.net/npm/cesium@1.146.0/Build/Cesium/Cesium.js"></script>
+<link href="https://cdn.jsdelivr.net/npm/cesium@1.146.0/Build/Cesium/Widgets/widgets.css" rel="stylesheet">
+<style>
+  :root {
+    --glass: rgba(16, 18, 22, .72);
+    --line: rgba(255, 255, 255, .09);
+    --text: #ecedef;
+    --muted: #8b9099;
+    --hover: rgba(255, 255, 255, .07);
+    --red: #ff4b36;
+    --red-glow: rgba(255, 75, 54, .45);
+  }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #000; font-family: system-ui, "Segoe UI", sans-serif; color: var(--text); }
+  #cesium { position: absolute; inset: 0; }
+  #cesium.armed canvas { cursor: crosshair; }
+  .glass {
+    background: var(--glass); border: 1px solid var(--line); border-radius: 14px;
+    backdrop-filter: blur(14px) saturate(1.2); -webkit-backdrop-filter: blur(14px) saturate(1.2);
+    box-shadow: 0 8px 30px rgba(0, 0, 0, .35);
+  }
+
+  /* ---- sidebar ---- */
+  #panel { position: absolute; top: 14px; left: 14px; z-index: 10; width: 232px; padding: 14px; display: flex; flex-direction: column; gap: 10px; }
+  #panel .brand { display: flex; align-items: center; gap: 8px; font-weight: 650; font-size: 14px; letter-spacing: .2px; }
+  #panel .brand svg { width: 18px; height: 18px; color: #f5c542; }
+  .field { position: relative; }
+  .field select {
+    appearance: none; width: 100%; background: rgba(255, 255, 255, .06); color: var(--text);
+    border: 1px solid var(--line); border-radius: 10px; padding: 10px 32px 10px 12px; font-size: 13.5px; cursor: pointer; outline: none;
+  }
+  .field select:focus { border-color: rgba(255, 255, 255, .25); }
+  .field select option { background: #1b1e23; }
+  .field::after { content: ""; position: absolute; right: 13px; top: 50%; width: 7px; height: 7px; margin-top: -6px;
+    border-right: 2px solid var(--muted); border-bottom: 2px solid var(--muted); transform: rotate(45deg); pointer-events: none; }
+  .search { position: relative; }
+  .search svg { position: absolute; left: 11px; top: 50%; width: 15px; height: 15px; margin-top: -7.5px; color: var(--muted); pointer-events: none; }
+  .search input {
+    width: 100%; box-sizing: border-box; background: rgba(255, 255, 255, .06); color: var(--text); border: 1px solid var(--line);
+    border-radius: 10px; padding: 10px 12px 10px 34px; font-size: 13.5px; outline: none;
+  }
+  .search input:focus { border-color: rgba(255, 255, 255, .25); }
+  .search input::placeholder { color: var(--muted); }
+  #qres { position: absolute; left: 0; right: 0; top: calc(100% + 6px); z-index: 20; display: none; overflow: hidden;
+    background: #1b1e23; border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 8px 24px rgba(0, 0, 0, .4); }
+  #qres div { padding: 8px 12px; font-size: 12.5px; cursor: pointer; }
+  #qres div:hover, #qres div.sel { background: var(--hover); }
+  #qres .empty { color: var(--muted); cursor: default; }
+  .yield { font-size: 12px; color: var(--muted); margin-top: -4px; padding-left: 2px; }
+
+  #drop {
+    display: flex; align-items: center; justify-content: center; gap: 8px; width: 100%; padding: 12px; border-radius: 11px;
+    font: 650 14px system-ui, "Segoe UI", sans-serif; letter-spacing: .6px; cursor: pointer; transition: all .15s;
+    color: var(--text); background: rgba(255, 255, 255, .06); border: 1px solid var(--line);
+  }
+  #drop:hover { background: rgba(255, 255, 255, .1); }
+  #drop svg { width: 16px; height: 16px; }
+  #drop.on { background: var(--red); border-color: var(--red); color: #fff; box-shadow: 0 0 0 4px var(--red-glow); animation: pulse 1.6s infinite; }
+  @keyframes pulse { 50% { box-shadow: 0 0 0 7px rgba(255, 75, 54, .15); } }
+
+  .row { display: flex; gap: 8px; }
+  .btn {
+    flex: 1; display: flex; align-items: center; justify-content: center; gap: 6px; padding: 9px 8px; border-radius: 10px; cursor: pointer;
+    background: transparent; border: 1px solid var(--line); color: var(--text); font-size: 12.5px; transition: background .15s;
+  }
+  .btn:hover { background: var(--hover); }
+  .btn svg { width: 14px; height: 14px; opacity: .85; }
+  .btn.active { background: rgba(255, 255, 255, .1); border-color: rgba(255, 255, 255, .22); }
+  .hint { font-size: 11.5px; color: var(--muted); text-align: center; min-height: 14px; }
+  .hint kbd { font: 11px ui-monospace, Consolas, monospace; border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; }
+
+  /* ---- info card (legend) ---- */
+  #infoBtn { position: absolute; left: 14px; bottom: 34px; z-index: 10; padding: 7px 12px; font-size: 12px; cursor: pointer; color: var(--muted); display: flex; gap: 6px; align-items: center; }
+  #infoBtn:hover { color: var(--text); }
+  #info { position: absolute; left: 14px; bottom: 74px; z-index: 10; width: 270px; padding: 14px; font-size: 12px; display: none; }
+  #info.open { display: block; }
+  #info h3 { margin: 0 0 8px; font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .8px; }
+  #info .r { display: flex; justify-content: space-between; gap: 8px; padding: 3px 0; }
+  #info .sw { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 8px; vertical-align: 1px; }
+  #info .sep { border-top: 1px solid var(--line); margin: 10px 0; }
+  #info p { margin: 0; color: var(--muted); line-height: 1.6; }
+  #info input { width: 100%; box-sizing: border-box; margin-top: 6px; background: rgba(255, 255, 255, .06); color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; font-size: 12px; }
+  #info a { color: #9cc7ff; }
+
+  #status { position: absolute; top: 14px; left: 50%; transform: translateX(-50%); z-index: 10; padding: 8px 14px; font-size: 12.5px; display: none; }
+
+  #compass { position: absolute; right: 16px; bottom: 40px; z-index: 10; width: 44px; height: 44px; border-radius: 50%; cursor: pointer; display: grid; place-items: center; }
+  #compass svg { width: 30px; height: 30px; }
+  .cesium-viewer-bottom { opacity: .5; }
+  .cesium-viewer-toolbar { top: 14px; right: 14px; }
+</style>
+</head>
+<body>
+<div id="cesium"></div>
+
+<div id="panel" class="glass">
+  <div class="brand">
+    <svg viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="12" r="2.2"/><path d="M12 2a10 10 0 0 1 8.66 5l-5.2 3a4 4 0 0 0-3.46-2zM3.34 7A10 10 0 0 1 12 2v6a4 4 0 0 0-3.46 2zM6.8 20.66 9.8 15.5a4 4 0 0 0 4.4 0l3 5.16a10 10 0 0 1-10.4 0z" transform="rotate(30 12 12)"/></svg>
+    Nuke Sim
+  </div>
+  <div class="search">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg>
+    <input id="q" type="text" placeholder="Search a place + Enter" autocomplete="off" spellcheck="false">
+    <div id="qres"></div>
+  </div>
+  <div class="field"><select id="preset"></select></div>
+  <div class="yield" id="yieldLbl"></div>
+
+  <button id="drop" title="Modalità sgancio (D)">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="8"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4"/></svg>
+    <span>DROP</span>
+  </button>
+
+  <div class="row">
+    <button class="btn active" id="rings" title="Mostra/nascondi i raggi dei danni">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4.5"/></svg>Raggi
+    </button>
+    <button class="btn" id="labels" title="Confini e nomi dei luoghi (L)">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6l6-3 6 3 6-3v15l-6 3-6-3-6 3z"/><path d="M9 3v15M15 6v15"/></svg>Etichette
+    </button>
+  </div>
+  <button class="btn" id="clear" title="Rimuovi tutte le esplosioni">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/></svg>Clear
+  </button>
+  <div class="hint" id="hint">Premi <kbd>D</kbd> o DROP, poi clicca</div>
+</div>
+
+<button id="infoBtn" class="glass">ⓘ Dati e comandi</button>
+<div id="info" class="glass">
+  <h3 id="infoTitle">Raggi</h3>
+  <div id="results"></div>
+  <div class="sep"></div>
+  <h3>Comandi</h3>
+  <p>Trascina: sposta · Rotella / destro: zoom<br>
+    Shift+trascina o centrale: ruota e inclina<br>
+    Ctrl+trascina: guarda intorno · Doppio clic: zoom<br>
+    Frecce, Shift+frecce, PgSu/PgGiù<br>
+    N: nord · U: dall'alto · R: entrambi · D: drop · L: etichette · Esc: esci</p>
+  <div class="sep"></div>
+  <p>Raggi stimati con le leggi di scala di Glasstone &amp; Dolan (come NUKEMAP). Valori indicativi.</p>
+  <div class="sep"></div>
+  <p>Token Cesium ion (se la mappa non carica, crealo gratis su <a href="https://ion.cesium.com/signup" target="_blank">ion.cesium.com</a>):</p>
+  <input id="token" type="text" placeholder="incolla token e premi Invio">
+</div>
+
+<div id="status" class="glass"></div>
+
+<div id="compass" class="glass" title="Nord in alto (N)"><svg viewBox="0 0 34 34"><g id="needle"><path d="M17 3 L21.5 17 L12.5 17 Z" fill="#ff4b36"/><path d="M17 31 L21.5 17 L12.5 17 Z" fill="#ccc"/></g></svg></div>
+
+<script>
+(async () => {
+const $ = id => document.getElementById(id);
+let statusTimer;
+const status = (t, ms = 6000) => { const s = $('status'); s.textContent = t; s.style.display = t ? 'block' : 'none'; clearTimeout(statusTimer); if (t && ms) statusTimer = setTimeout(() => s.style.display = 'none', ms); };
+
+// ---------- Viewer (Google 3D only) ----------
+const savedTok = (() => { try { return localStorage.getItem('ionToken'); } catch { return null; } })();
+if (savedTok) { Cesium.Ion.defaultAccessToken = savedTok; $('token').value = savedTok; }
+$('token').onkeydown = e => { if (e.key === 'Enter') { try { localStorage.setItem('ionToken', $('token').value.trim()); } catch {} location.reload(); } };
+
+const viewer = new Cesium.Viewer('cesium', {
+  baseLayer: false, geocoder: false, animation: false, timeline: false, baseLayerPicker: false, homeButton: false,
+  sceneModePicker: false, navigationHelpButton: false, fullscreenButton: false, infoBox: false,
+  selectionIndicator: false, msaaSamples: 4,
+});
+viewer.useBrowserRecommendedResolution = false;
+const scene = viewer.scene, camera = viewer.camera;
+scene.skyAtmosphere.show = true;
+viewer.clock.shouldAnimate = false;
+{ const d = new Date(); d.setUTCHours(11, 0, 0, 0); viewer.clock.currentTime = Cesium.JulianDate.fromDate(d); }
+
+// fallback visibile subito: satellite piatto, sostituito da Google 3D appena carica
+viewer.imageryLayers.addImageryProvider(new Cesium.UrlTemplateImageryProvider({
+  url: 'https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', maximumLevel: 19, credit: 'Esri' }));
+async function loadGoogle(attempt = 1) {
+  try {
+    const tileset = await Cesium.createGooglePhotorealistic3DTileset({ onlyUsingWithGoogleGeocoder: true });
+    tileset.enableCollision = true;
+    tileset.customShader = window.__bShader;
+    scene.primitives.add(tileset);
+    scene.globe.show = false;
+    window.__tileset = tileset;
+    if (window.__labelsOn) window.__labelsOn(true);
+    status('');
+  } catch (e) {
+    scene.globe.show = true;
+    const busy = String(e.statusCode || e.message || e).includes('429');
+    status(busy ? `Google 3D occupato (token di prova condiviso), riprovo… (${attempt}) · usa un tuo token gratuito in "Dati e comandi"`
+                : 'Google 3D non disponibile: serve un token Cesium ion (vedi "Dati e comandi").', 0);
+    if (busy && attempt < 20) setTimeout(() => loadGoogle(attempt + 1), 8000);
+  }
+}
+scene.globe.show = true;
+loadGoogle();
+
+camera.setView({
+  destination: Cesium.Cartesian3.fromDegrees(9.175, 45.43, 2500),
+  orientation: { heading: Cesium.Math.toRadians(20), pitch: Cesium.Math.toRadians(-35), roll: 0 },
+});
+
+// ---------- Google Earth–style controls ----------
+const ctl = scene.screenSpaceCameraController;
+const T = Cesium.CameraEventType, M = Cesium.KeyboardEventModifier;
+ctl.rotateEventTypes = T.LEFT_DRAG;
+ctl.translateEventTypes = T.LEFT_DRAG;
+ctl.zoomEventTypes = [T.WHEEL, T.PINCH];                       // rotella: zoom verso il cursore (Cesium)
+ctl.enableTilt = false;                                          // tilt e zoom col destro: gestiti sotto
+ctl.lookEventTypes = [{ eventType: T.LEFT_DRAG, modifier: M.CTRL }];
+ctl.minimumZoomDistance = 15;
+ctl.enableCollisionDetection = true;
+viewer.cesiumWidget.screenSpaceEventHandler.removeInputAction(Cesium.ScreenSpaceEventType.LEFT_DOUBLE_CLICK);
+
+const pickWorld = pos => {
+  let p = scene.pickPositionSupported ? scene.pickPosition(pos) : undefined;
+  if (!Cesium.defined(p) && scene.globe.show) p = scene.globe.pick(camera.getPickRay(pos), scene);
+  if (!Cesium.defined(p)) p = camera.pickEllipsoid(pos);
+  return p;
+};
+
+// ---------- Google Earth drags: middle (or Shift+left) = tilt/rotate around the cursor point,
+//            right = zoom toward the cursor point ----------
+const cv = scene.canvas;
+cv.addEventListener('contextmenu', e => e.preventDefault());
+cv.addEventListener('mousedown', e => { if (e.button === 1) e.preventDefault(); }); // no autoscroll
+const evPos = e => { const r = cv.getBoundingClientRect(); return new Cesium.Cartesian2(e.clientX - r.left, e.clientY - r.top); };
+let drag = null;
+const C3 = Cesium.Cartesian3;
+function orbit(P, axis, angle) {
+  const R = Cesium.Matrix3.fromQuaternion(Cesium.Quaternion.fromAxisAngle(axis, angle));
+  const rel = C3.subtract(camera.positionWC, P, new C3());
+  const pos = C3.add(P, Cesium.Matrix3.multiplyByVector(R, rel, new C3()), new C3());
+  return {
+    pos,
+    dir: Cesium.Matrix3.multiplyByVector(R, camera.directionWC, new C3()),
+    up: Cesium.Matrix3.multiplyByVector(R, camera.upWC, new C3()),
+  };
+}
+function elevation(pos, P, up) {
+  const v = C3.subtract(pos, P, new C3());
+  return Math.asin(C3.dot(v, up) / C3.magnitude(v));
+}
+function tiltAt(dx, dy) {
+  const { P, up } = drag;
+  // rotazione orizzontale attorno alla verticale del punto
+  if (dx) {
+    const o = orbit(P, up, -dx * (2 * Math.PI / cv.clientWidth));
+    camera.setView({ destination: o.pos, orientation: { direction: o.dir, up: o.up } });
+  }
+  // inclinazione attorno all'asse orizzontale della camera, passando per il punto
+  if (dy) {
+    const right = C3.normalize(C3.cross(camera.directionWC, up, new C3()), new C3());
+    const o = orbit(P, right, -dy * (Math.PI / cv.clientHeight));
+    const el = elevation(o.pos, P, up);
+    const lookDown = C3.dot(o.dir, up) < 0.02; // non guardare mai sopra l'orizzonte
+    if (el > Cesium.Math.toRadians(3) && el < Cesium.Math.toRadians(89.5) && lookDown)
+      camera.setView({ destination: o.pos, orientation: { direction: o.dir, up: o.up } });
+  }
+}
+function zoomAt(dy) {
+  const { P } = drag;
+  const d = C3.distance(camera.positionWC, P);
+  const nd = Cesium.Math.clamp(d * Math.exp(-dy * 0.006), 20, 3e7);
+  const dir = C3.normalize(C3.subtract(P, camera.positionWC, new C3()), new C3());
+  camera.move(dir, d - nd);
+}
+cv.addEventListener('pointerdown', e => {
+  const mode = e.button === 1 || (e.button === 0 && e.shiftKey) ? 'tilt' : e.button === 2 ? 'zoom' : null;
+  if (!mode) return;
+  const P = pickWorld(evPos(e));
+  if (!P) return;
+  drag = { mode, P, up: Cesium.Ellipsoid.WGS84.geodeticSurfaceNormal(P, new C3()), last: evPos(e) };
+  try { cv.setPointerCapture(e.pointerId); } catch {}
+});
+cv.addEventListener('pointermove', e => {
+  if (!drag) return;
+  const p = evPos(e), dx = p.x - drag.last.x, dy = p.y - drag.last.y;
+  drag.last = p;
+  if (drag.mode === 'zoom') zoomAt(dy); else tiltAt(dx, dy);
+});
+const endDrag = () => { drag = null; };
+cv.addEventListener('pointerup', endDrag);
+cv.addEventListener('pointercancel', endDrag);
+
+// ---------- Drop mode ----------
+let armed = false;
+function setArmed(v) {
+  armed = v;
+  $('drop').classList.toggle('on', v);
+  $('drop').querySelector('span').textContent = v ? 'DROP ATTIVO' : 'DROP';
+  $('cesium').classList.toggle('armed', v);
+  $('hint').innerHTML = v ? 'Clicca sulla mappa · <kbd>Esc</kbd> per uscire' : 'Premi <kbd>D</kbd> o DROP, poi clicca';
+}
+$('drop').onclick = () => setArmed(!armed);
+
+const handler = new Cesium.ScreenSpaceEventHandler(scene.canvas);
+let downPos = null, clickTimer = null;
+handler.setInputAction(e => { downPos = Cesium.Cartesian2.clone(e.position); }, Cesium.ScreenSpaceEventType.LEFT_DOWN);
+handler.setInputAction(e => {
+  if (!armed || !downPos || Cesium.Cartesian2.distance(downPos, e.position) > 4) return;
+  const pos = Cesium.Cartesian2.clone(e.position);
+  clearTimeout(clickTimer);
+  clickTimer = setTimeout(() => { const p = pickWorld(pos); if (p) detonateAt(p); }, 250);
+}, Cesium.ScreenSpaceEventType.LEFT_CLICK);
+handler.setInputAction(e => {
+  clearTimeout(clickTimer);
+  const p = pickWorld(e.position); if (!p) return;
+  const dest = Cesium.Cartesian3.lerp(camera.positionWC, p, 0.5, new Cesium.Cartesian3());
+  camera.flyTo({ destination: dest, orientation: { heading: camera.heading, pitch: camera.pitch, roll: 0 }, duration: 0.6 });
+}, Cesium.ScreenSpaceEventType.LEFT_DOUBLE_CLICK);
+
+// ---------- Labels & borders (Esri, English, international worldview) ----------
+const REF_URL = 'https://services.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}';
+const refProvider = () => new Cesium.UrlTemplateImageryProvider({ url: REF_URL, maximumLevel: 19, credit: 'Esri World Boundaries and Places' });
+let labelsOn = false, labGlobe = null, labTiles = null;
+function setLabels(on) {
+  labelsOn = on;
+  $('labels').classList.toggle('active', on);
+  if (labGlobe) { viewer.imageryLayers.remove(labGlobe); labGlobe = null; }
+  if (labTiles && window.__tileset) { window.__tileset.imageryLayers.remove(labTiles); labTiles = null; }
+  if (!on) return;
+  labGlobe = viewer.imageryLayers.addImageryProvider(refProvider());
+  if (window.__tileset) labTiles = window.__tileset.imageryLayers.addImageryProvider(refProvider());
+}
+window.__labelsOn = () => labelsOn && setLabels(true);
+$('labels').onclick = () => setLabels(!labelsOn);
+
+// ---------- Search (Google geocoder via Cesium ion) ----------
+const geocoder = new Cesium.IonGeocoderService({ scene, geocodeProviderType: Cesium.IonGeocodeProviderType.GOOGLE });
+let qResults = [], qSel = -1, qTimer = null, qSeq = 0;
+const qres = $('qres');
+function renderResults() {
+  qres.style.display = 'block';
+  qres.innerHTML = qResults.length
+    ? qResults.map((r, i) => `<div data-i="${i}" class="${i === qSel ? 'sel' : ''}">${r.displayName.replace(/</g, '&lt;')}</div>`).join('')
+    : '<div class="empty">Nessun risultato</div>';
+}
+function goTo(r) {
+  qres.style.display = 'none';
+  $('q').value = r.displayName; $('q').blur();
+  camera.flyTo({ destination: r.destination, duration: 2 });
+}
+async function runSearch(type) {
+  const text = $('q').value.trim(), seq = ++qSeq;
+  if (text.length < 2) { qres.style.display = 'none'; return; }
+  try {
+    const res = await geocoder.geocode(text, type);
+    if (seq !== qSeq) return;
+    qResults = res.slice(0, 6); qSel = -1;
+    if (qResults.length) return goTo(qResults[0]);
+    renderResults();
+  } catch (e) { if (seq === qSeq) { qResults = []; renderResults(); } }
+}
+$('q').addEventListener('input', () => { qres.style.display = 'none'; });
+$('q').addEventListener('keydown', e => {
+  if (e.key === 'Enter') runSearch(Cesium.GeocodeType.SEARCH);
+  else if (e.key === 'Escape') { qres.style.display = 'none'; $('q').blur(); }
+});
+qres.addEventListener('mousedown', e => { const i = e.target.dataset.i; if (i !== undefined) { e.preventDefault(); goTo(qResults[+i]); } });
+$('q').addEventListener('blur', () => setTimeout(() => qres.style.display = 'none', 150));
+
+// ---------- Keyboard ----------
+const keys = new Set();
+document.addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
+  const k = e.key.toLowerCase();
+  if (k === 'n' || k === 'r') northUp();
+  if (k === 'u' || k === 'r') topDown();
+  if (k === 'd') setArmed(!armed);
+  if (k === 'l') setLabels(!labelsOn);
+  if (k === 'escape') setArmed(false);
+  keys.add(e.key); if (e.key.startsWith('Arrow') || e.key.startsWith('Page')) e.preventDefault();
+});
+document.addEventListener('keyup', e => keys.delete(e.key));
+window.addEventListener('blur', () => keys.clear());
+
+function centerPoint() { return pickWorld(new Cesium.Cartesian2(scene.canvas.clientWidth / 2, scene.canvas.clientHeight / 2)); }
+function orbitAround(target, dHeading, dPitch) {
+  const range = Cesium.Cartesian3.distance(camera.positionWC, target);
+  camera.lookAt(target, new Cesium.HeadingPitchRange(camera.heading + dHeading, Cesium.Math.clamp(camera.pitch + dPitch, -Cesium.Math.PI_OVER_TWO, -0.02), range));
+  camera.lookAtTransform(Cesium.Matrix4.IDENTITY);
+}
+function flyAround(heading, pitch) {
+  const t = centerPoint();
+  if (!t) { // guardando il cielo: riporta la vista verso terra
+    camera.flyTo({ destination: camera.positionWC, orientation: { heading, pitch: Math.min(pitch, Cesium.Math.toRadians(-45)), roll: 0 }, duration: 0.6 });
+    return;
+  }
+  const range = Cesium.Cartesian3.distance(camera.positionWC, t);
+  camera.flyToBoundingSphere(new Cesium.BoundingSphere(t, 0), { offset: new Cesium.HeadingPitchRange(heading, pitch, range), duration: 0.6 });
+}
+const northUp = () => flyAround(0, camera.pitch);
+const topDown = () => flyAround(camera.heading, -Cesium.Math.PI_OVER_TWO);
+$('compass').onclick = northUp;
+
+function handleKeys(dt) {
+  if (!keys.size) return;
+  const h = Cesium.Cartographic.fromCartesian(camera.positionWC).height;
+  const step = Math.max(h, 50) * 0.9 * dt;
+  if (keys.has('Shift')) {
+    let dh = 0, dp = 0;
+    if (keys.has('ArrowLeft')) dh -= 1.2 * dt; if (keys.has('ArrowRight')) dh += 1.2 * dt;
+    if (keys.has('ArrowUp')) dp += 0.8 * dt; if (keys.has('ArrowDown')) dp -= 0.8 * dt;
+    const t = (dh || dp) && centerPoint(); if (t) orbitAround(t, dh, dp);
+  } else {
+    const enu = Cesium.Transforms.eastNorthUpToFixedFrame(camera.positionWC);
+    const east = Cesium.Cartesian3.fromCartesian4(Cesium.Matrix4.getColumn(enu, 0, new Cesium.Cartesian4()));
+    const north = Cesium.Cartesian3.fromCartesian4(Cesium.Matrix4.getColumn(enu, 1, new Cesium.Cartesian4()));
+    const s = Math.sin(camera.heading), c = Math.cos(camera.heading);
+    const comb = (a, ka, b, kb) => Cesium.Cartesian3.add(Cesium.Cartesian3.multiplyByScalar(a, ka, new Cesium.Cartesian3()), Cesium.Cartesian3.multiplyByScalar(b, kb, new Cesium.Cartesian3()), new Cesium.Cartesian3());
+    const fwd = comb(north, c, east, s), right = comb(east, c, north, -s);
+    if (keys.has('ArrowUp')) camera.move(fwd, step); if (keys.has('ArrowDown')) camera.move(fwd, -step);
+    if (keys.has('ArrowRight')) camera.move(right, step); if (keys.has('ArrowLeft')) camera.move(right, -step);
+  }
+  if (keys.has('PageUp') || keys.has('+') || keys.has('=')) camera.zoomIn(step * 1.5);
+  if (keys.has('PageDown') || keys.has('-')) camera.zoomOut(step * 1.5);
+}
+
+// ---------- Building shader (tint, glow) ----------
+const MAX = 8, U = Cesium.UniformType;
+const shaderUniforms = {};
+let fxCalls = '';
+for (let i = 0; i < MAX; i++) {
+  shaderUniforms['u_c' + i] = { type: U.VEC3, value: new Cesium.Cartesian3() };
+  shaderUniforms['u_n' + i] = { type: U.VEC3, value: new Cesium.Cartesian3(0, 0, 1) };
+  shaderUniforms['u_a' + i] = { type: U.VEC4, value: new Cesium.Cartesian4() };            // shock, r20, r5, r1
+  shaderUniforms['u_b' + i] = { type: U.VEC4, value: new Cesium.Cartesian4(0, 0, 0, 1) };  // rth, burn, glow, glowR
+  fxCalls += `fx(p, u_c${i}, u_n${i}, u_a${i}, u_b${i}, material);\n`;
+}
+const bShader = new Cesium.CustomShader({
+  uniforms: shaderUniforms,
+  fragmentShaderText: `
+  void fx(vec3 p, vec3 c, vec3 up, vec4 a, vec4 b, inout czm_modelMaterial m) {
+    if (a.y <= 0.0) return;
+    vec3 d3 = p - c;
+    float h = dot(d3, up);
+    float d = length(d3 - up * h);
+    float lim = min(a.x, a.z);
+    float k = (1.0 - smoothstep(lim * 0.85, lim, d)) * mix(0.55, 0.9, 1.0 - smoothstep(a.y * 0.7, a.y * 1.2, d));
+    m.diffuse = mix(m.diffuse, vec3(0.1, 0.08, 0.065), k);
+    m.diffuse += vec3(1.0, 0.55, 0.2) * b.z / (1.0 + pow(d / b.w, 2.0));
+  }
+  void fragmentMain(FragmentInput fsInput, inout czm_modelMaterial material) {
+    vec3 p = fsInput.attributes.positionWC;
+    ${fxCalls}
+  }`,
+});
+window.__bShader = bShader;
+if (window.__tileset) window.__tileset.customShader = bShader;
+
+// ---------- Flash ----------
+let FLASH = 0, WARM = 0;
+scene.postProcessStages.add(new Cesium.PostProcessStage({
+  fragmentShader: `
+    uniform sampler2D colorTexture; uniform float u_flash; uniform float u_warm;
+    in vec2 v_textureCoordinates;
+    void main() {
+      vec3 c = texture(colorTexture, v_textureCoordinates).rgb;
+      c *= vec3(1.0 + 0.45 * u_warm, 1.0 + 0.18 * u_warm, 1.0 - 0.1 * u_warm);
+      out_FragColor = vec4(mix(c, vec3(1.0, 0.98, 0.93), u_flash), 1.0);
+    }`,
+  uniforms: { u_flash: () => FLASH, u_warm: () => WARM },
+}));
+
+// ---------- Weapons & physics ----------
+const PRESETS = [
+  ['Davy Crockett', 0.02, 'surface'], ['Little Boy — Hiroshima', 15, 'air'], ['Fat Man — Nagasaki', 21, 'air'],
+  ['W76-1 · Trident II', 90, 'air'], ['W87 · Minuteman III', 300, 'air'], ['W88 · Trident II', 475, 'air'],
+  ['B83', 1200, 'air'], ['Ivy Mike', 10400, 'surface'], ['Castle Bravo', 15000, 'surface'], ['Tsar Bomba', 50000, 'air'],
+];
+PRESETS.forEach(([n], i) => $('preset').add(new Option(n, i)));
+$('preset').value = 1;
+const cur = () => { const [name, W, b] = PRESETS[$('preset').value]; return { name, W, air: b === 'air' }; };
+
+const interpLog = (tab, W) => {
+  const x = Math.log10(W);
+  if (x <= tab[0][0]) return tab[0][1] * Math.pow(W / Math.pow(10, tab[0][0]), 0.3);
+  for (let i = 0; i < tab.length - 1; i++) {
+    const [x0, y0] = tab[i], [x1, y1] = tab[i + 1];
+    if (x <= x1) { const f = (x - x0) / (x1 - x0); return Math.exp(Math.log(y0) + f * (Math.log(y1) - Math.log(y0))); }
+  }
+  const [xa, ya] = tab[tab.length - 2], [xb, yb] = tab[tab.length - 1];
+  return yb * Math.pow(10, (x - xb) * Math.log10(yb / ya) / (xb - xa));
+};
+const L = Math.log10;
+const CLOUD_TOP = [[0, 3.5], [L(15), 8.5], [2, 13], [3, 21], [4, 38], [L(50000), 64]];  // km
+const CLOUD_RAD = [[0, 0.8], [L(15), 2.5], [2, 4.5], [3, 10], [4, 25], [L(50000), 47]]; // km
+
+function effects(W, air) {
+  const c = Math.cbrt(W), p = air ? 1 : 0.7, th = air ? 1 : 0.75;
+  const E = {
+    W, air,
+    Rfb: 70 * Math.pow(W, 0.4) * (air ? 1 : 1.26),
+    r20: 280 * c * p, r5: 650 * c * p, r1: 1700 * c * p,
+    rth: 630 * Math.pow(W, 0.41) * th,
+    rrad: 720 * Math.pow(W, 0.19),
+    hob: air ? 235 * c : 0,
+    H: interpLog(CLOUD_TOP, W) * 1000,
+    Rcap: interpLog(CLOUD_RAD, W) * 1000,
+    tmax: 0.25 * Math.pow(W, 0.3),
+    Trise: 220 * Math.pow(W, 0.07),
+  };
+  E.tglow = 2.5 * E.tmax + 1;
+  E.Rstem = 0.17 * E.Rcap;
+  return E;
+}
+const km = m => m < 1000 ? Math.round(m) + ' m' : (m / 1000).toLocaleString('it-IT', { maximumFractionDigits: m < 10000 ? 2 : 1 }) + ' km';
+const fmtW = W => W >= 1000 ? (W / 1000).toLocaleString('it-IT', { maximumFractionDigits: 1 }) + ' Mt' : W < 1 ? Math.round(W * 1000) + ' t' : W + ' kt';
+function legendOf(E) {
+  return [
+    ['Palla di fuoco', E.Rfb, '#ffd84a'], ['Radiazioni 500 rem', E.rrad, '#55dd66'],
+    ['20 psi · distruzione totale', E.r20, '#ff3030'], ['5 psi · edifici crollati', E.r5, '#ff8a2a'],
+    ['Ustioni di 3° grado', E.rth, '#ffb84d'], ['1 psi · vetri rotti', E.r1, '#7fb2ff'],
+  ];
+}
+function showResults() {
+  const { name, W, air } = cur(), E = effects(W, air);
+  $('yieldLbl').textContent = `${fmtW(W)} · ${air ? 'esplosione in aria' : 'esplosione al suolo'}`;
+  $('infoTitle').textContent = name;
+  $('results').innerHTML = legendOf(E).map(([n, r, c]) =>
+    `<div class="r"><span><span class="sw" style="background:${c}"></span>${n}</span><b>${km(r)}</b></div>`).join('') +
+    `<div class="r"><span><span class="sw" style="background:#ddd"></span>Altezza fungo</span><b>${km(E.H)}</b></div>` +
+    `<div class="r"><span><span class="sw" style="background:#999"></span>Diametro fungo</span><b>${km(2 * E.Rcap)}</b></div>`;
+}
+$('preset').onchange = showResults;
+showResults();
+$('infoBtn').onclick = () => $('info').classList.toggle('open');
+
+// ---------- Smoke texture: soft fbm noise ----------
+const puffTex = (() => {
+  const s = 256, cv = document.createElement('canvas'); cv.width = cv.height = s;
+  const g = cv.getContext('2d'), img = g.createImageData(s, s);
+  const N = 32, grid = [];
+  let seed = 11; const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+  for (let i = 0; i < N * N; i++) grid.push(rnd());
+  const val = (x, y) => {
+    const xi = Math.floor(x), yi = Math.floor(y), xf = x - xi, yf = y - yi;
+    const u = xf * xf * (3 - 2 * xf), v = yf * yf * (3 - 2 * yf);
+    const at = (a, b) => grid[((b % N + N) % N) * N + ((a % N + N) % N)];
+    return (at(xi, yi) * (1 - u) + at(xi + 1, yi) * u) * (1 - v) + (at(xi, yi + 1) * (1 - u) + at(xi + 1, yi + 1) * u) * v;
+  };
+  const fbm = (x, y) => { let a = 0.5, f = 1, sum = 0; for (let o = 0; o < 5; o++) { sum += a * val(x * f, y * f); a *= 0.5; f *= 2.03; } return sum; };
+  for (let y = 0; y < s; y++) for (let x = 0; x < s; x++) {
+    const nx = x / s * 4, ny = y / s * 4;
+    const n = fbm(nx, ny), n2 = fbm(nx + 7.3, ny + 2.1);
+    const dx = x / s - 0.5, dy = y / s - 0.5, r = Math.sqrt(dx * dx + dy * dy) * 2;
+    const fall = Math.max(0, 1 - r); // soft circular falloff
+    const a = Math.max(0, Math.min(1, (n * 1.35 - 0.25) * fall * fall * 1.8));
+    const l = Math.round(222 + 33 * n2);
+    const i = (y * s + x) * 4;
+    img.data[i] = img.data[i + 1] = img.data[i + 2] = l; img.data[i + 3] = Math.round(a * 255);
+  }
+  g.putImageData(img, 0, 0);
+  return cv;
+})();
+
+// ---------- Detonations ----------
+const lerp = (a, b, f) => a + (b - a) * f;
+const clamp01 = x => Math.max(0, Math.min(1, x));
+const smooth = (a, b, x) => { const t = clamp01((x - a) / (b - a)); return t * t * (3 - 2 * t); };
+const tmpCol = new Cesium.Color();
+const SPEED = 12;
+let blasts = [], nextSlot = 0, showRings = true;
+
+$('rings').onclick = () => {
+  showRings = !showRings;
+  $('rings').classList.toggle('active', showRings);
+  for (const D of blasts) { D.entities.forEach(e => e.show = showRings); D.ground.show = showRings; }
+};
+
+function setSlot(slot, D) {
+  bShader.setUniform('u_c' + slot, D ? D.groundPos : new Cesium.Cartesian3());
+  bShader.setUniform('u_n' + slot, D ? D.up : new Cesium.Cartesian3(0, 0, 1));
+  bShader.setUniform('u_a' + slot, D ? new Cesium.Cartesian4(D.shock, D.E.r20, D.E.r5, D.E.r1) : new Cesium.Cartesian4());
+  bShader.setUniform('u_b' + slot, D ? new Cesium.Cartesian4(D.E.rth, D.burn, D.glowB, D.E.Rfb * 3 + D.E.hob) : new Cesium.Cartesian4(0, 0, 0, 1));
+}
+function removeBlast(D) {
+  scene.primitives.remove(D.bb);
+  scene.primitives.remove(D.ground);
+  D.entities.forEach(e => viewer.entities.remove(e));
+  setSlot(D.slot, null);
+  blasts = blasts.filter(b => b !== D);
+}
+$('clear').onclick = () => { [...blasts].forEach(removeBlast); FLASH = WARM = 0; };
+
+function makePuffs(E) {
+  const P = [], R = Math.random;
+  const ball = () => { let x, y, z; do { x = R() * 2 - 1; y = R() * 2 - 1; z = R() * 2 - 1; } while (x * x + y * y + z * z > 1); return { ux: x, uy: y, uz: z }; };
+  const add = (type, n, extra) => { for (let i = 0; i < n; i++) P.push(Object.assign({ type, th: R() * Math.PI * 2, ph: R() * Math.PI * 2, r1: R(), r2: R(), r3: R(), r4: R(), rot: R() * Math.PI * 2 }, extra && extra(i, n))); };
+  add('torus', 520); add('fill', 160, ball); add('core', 70, ball);
+  add('stem', 300, (i, n) => ({ r1: (i + R()) / n }));
+  if (!E.air) add('dust', 90); // polvere alla base solo per esplosioni al suolo
+  return P;
+}
+
+function detonateAt(picked) {
+  const groundPos = Cesium.Cartesian3.clone(picked);
+  const { W, air } = cur();
+  const E = effects(W, air);
+  if (blasts.length >= MAX) removeBlast(blasts[0]);
+  let slot = nextSlot; while (blasts.some(b => b.slot === slot)) slot = (slot + 1) % MAX;
+  nextSlot = (slot + 1) % MAX;
+  const enu = Cesium.Transforms.eastNorthUpToFixedFrame(groundPos);
+  const local = (x, y, z, out) => Cesium.Matrix4.multiplyByPoint(enu, Cesium.Cartesian3.fromElements(x, y, z, out || new Cesium.Cartesian3()), out || new Cesium.Cartesian3());
+  const D = {
+    E, slot, groundPos, local, t: 0, real: 0, shock: 0, burn: 0, glowB: 0, entities: [], rings: {},
+    up: Cesium.Ellipsoid.WGS84.geodeticSurfaceNormal(groundPos, new Cesium.Cartesian3()),
+    puffs: makePuffs(E),
+  };
+  D.bb = scene.primitives.add(new Cesium.BillboardCollection({ blendOption: Cesium.BlendOption.TRANSLUCENT }));
+  D.bbs = D.puffs.map(() => D.bb.add({ image: puffTex, sizeInMeters: true, width: 1, height: 1, show: false, position: groundPos }));
+  D.maxR = E.r1 * 1.15;
+  D.groundMat = new Cesium.Material({
+    fabric: {
+      uniforms: { shock: 0, glow: 0, burn: 0, rings: showRings ? 1 : 0, rth: E.rth / D.maxR, rfb: E.Rfb / D.maxR },
+      source: `
+      czm_material czm_getMaterial(czm_materialInput mi) {
+        czm_material m = czm_getDefaultMaterial(mi);
+        float r = length(mi.st - 0.5) * 2.0;
+        float ring = shock > 0.001 ? smoothstep(shock - 0.035, shock, r) * (1.0 - smoothstep(shock, shock + 0.006, r)) : 0.0;
+        ring *= (1.0 - smoothstep(0.75, 1.0, shock)) * rings;
+        float g = glow * exp(-pow(r / max(rfb * 3.0, 0.005), 2.0));
+        float scorch = burn * (0.6 * (1.0 - smoothstep(rfb * 0.8, rfb * 3.0, r)) + 0.3 * (1.0 - smoothstep(rth * 0.85, rth, r)));
+        m.diffuse = mix(vec3(0.07, 0.05, 0.035), vec3(1.0, 0.8, 0.55), clamp(ring + g, 0.0, 1.0));
+        m.emission = vec3(1.0, 0.7, 0.4) * (ring * 0.5 + g);
+        m.alpha = clamp(scorch + ring * 0.5 + g, 0.0, 0.95);
+        return m;
+      }`,
+    },
+  });
+  D.ground = scene.primitives.add(new Cesium.GroundPrimitive({
+    geometryInstances: new Cesium.GeometryInstance({ geometry: new Cesium.EllipseGeometry({ center: groundPos, semiMajorAxis: D.maxR, semiMinorAxis: D.maxR }) }),
+    appearance: new Cesium.MaterialAppearance({ material: D.groundMat, translucent: true, flat: true }),
+    asynchronous: false, show: showRings,
+  }));
+  blasts.push(D);
+  setSlot(slot, D);
+}
+
+function addRing(D, key, R, color) {
+  if (D.rings[key]) return;
+  D.rings[key] = true;
+  const pts = [];
+  for (let i = 0; i <= 160; i++) { const a = i / 160 * Math.PI * 2; pts.push(D.local(R * Math.cos(a), R * Math.sin(a), 0)); }
+  D.entities.push(viewer.entities.add({ show: showRings, polyline: { positions: pts, clampToGround: true, width: 2.5, material: Cesium.Color.fromCssColorString(color).withAlpha(0.9) } }));
+}
+
+function geom(D, t) {
+  const E = D.E;
+  const Rf = E.Rfb * Math.pow(clamp01(t / E.tmax), 0.4);
+  const u = Math.min(t / E.Trise, 1), e = 1 - Math.pow(1 - u, 2.5);
+  const thickF = Math.min(E.Rcap * 0.6, E.H * 0.42);
+  const thick = lerp(Rf * 1.8, thickF, e);
+  const top = lerp(E.hob + Rf * 0.9, E.H, e);
+  const spread = 1 + 0.12 * Math.min(1.5, Math.max(0, t / E.Trise - 1));
+  const Rc = Math.max(Rf, lerp(Rf, E.Rcap, Math.pow(e, 1.15))) * spread;
+  const stemTop = Math.max(0, top - thick * 0.75) * Math.pow(clamp01((t - 2 * E.tmax) / (E.Trise * 0.5)), 0.8);
+  const Rstem = Math.max(E.Rstem * (0.35 + 0.65 * e), Rf * 0.3);
+  return { Rf, u, thick, top, zc: top - thick / 2, Rc, stemTop, Rstem, omega: -(0.09 * (1 - u) + 0.012) };
+}
+function fireColor(f) {
+  if (f < 0.25) return [1, 0.96, 0.82];
+  if (f < 0.7) { const k = (f - 0.25) / 0.45; return [1, lerp(0.96, 0.55, k), lerp(0.82, 0.18, k)]; }
+  const k = clamp01((f - 0.7) / 1.3); return [lerp(1, 0.55, k), lerp(0.55, 0.16, k), lerp(0.18, 0.06, k)];
+}
+
+function updateCloud(D, dtSim) {
+  const E = D.E, t = D.t, G = geom(D, t);
+  const glow = Math.exp(-t / E.tglow), glow2 = Math.exp(-t / (E.tglow * 3));
+  const fc = fireColor(t / E.tglow);
+  const sm = clamp01(t / (E.Trise * 0.35));
+  const smoke = [lerp(0.62, 0.95, sm), lerp(0.42, 0.93, sm), lerp(0.30, 0.91, sm)];
+  const capBot = G.zc - G.thick / 2;
+  const camPos = camera.positionWC;
+  const fadeIn = smooth(0, 0.03, t);
+  const items = [];
+  for (const p of D.puffs) {
+    let x, y, z, size, shade = 1, heat = 0, alpha, base = smoke, under = 0;
+    if (p.type === 'torus') {
+      p.ph += dtSim * G.omega * (0.7 + 0.6 * p.r4);
+      const ring = G.Rc * (0.58 + 0.1 * p.r1), b = G.Rc * 0.36 * (0.75 + 0.4 * p.r2);
+      const rr = ring + b * Math.cos(p.ph);
+      x = rr * Math.cos(p.th); y = rr * Math.sin(p.th); z = G.zc + G.thick * 0.45 * Math.sin(p.ph);
+      size = G.Rc * (0.6 + 0.35 * p.r3);
+      shade = 0.4 + 0.6 * clamp01((z - capBot) / G.thick); heat = 0.75; under = Math.max(0, -Math.sin(p.ph));
+      alpha = 0.42 * fadeIn;
+    } else if (p.type === 'fill') {
+      x = G.Rc * 0.55 * p.ux; y = G.Rc * 0.55 * p.uy; z = G.zc + G.thick * 0.35 * p.uz;
+      size = G.Rc * (0.75 + 0.3 * p.r3); shade = 0.5 + 0.45 * clamp01((z - capBot) / G.thick); heat = 1; alpha = 0.4 * fadeIn;
+    } else if (p.type === 'core') {
+      alpha = 0.7 * Math.exp(-t / (E.tglow * 1.4)); if (alpha < 0.01) continue;
+      const R = G.Rf * 0.5; x = R * p.ux; y = R * p.uy; z = G.zc + R * p.uz;
+      size = G.Rf * (1.0 + 0.5 * p.r3) + 1; heat = 1;
+    } else if (p.type === 'stem') {
+      const h = p.r1; z = h * Math.max(G.top - G.thick * 0.6, 0);
+      if (z > G.stemTop || G.stemTop <= 0) continue;
+      let rs = G.Rstem * (0.55 + 0.45 * h * h);
+      if (h > 0.8) rs += (h - 0.8) / 0.2 * G.Rc * 0.28;
+      const a = p.th + t * 0.03, rr = rs * 0.35 * p.r2;
+      x = rr * Math.cos(a); y = rr * Math.sin(a);
+      size = rs * 2.7 + G.Rstem * 0.4; shade = 0.55 + 0.35 * h;
+      base = [lerp(0.5, 0.72, sm), lerp(0.42, 0.66, sm), lerp(0.34, 0.6, sm)];
+      alpha = 0.38 * smooth(0, 0.08 * G.stemTop + 1, G.stemTop - z);
+    } else {
+      const dR = Math.min(D.shock, E.r20 * 1.2), dH = G.Rstem * 0.9 * smooth(0, E.Trise * 0.3, t) + 50;
+      if (dR < 10) continue;
+      const r = dR * Math.sqrt(p.r1); x = r * Math.cos(p.th); y = r * Math.sin(p.th); z = p.r2 * dH;
+      size = dH * 1.8 + dR * 0.15; shade = 0.9; base = [0.78, 0.7, 0.62];
+      alpha = 0.16 * (1 - smooth(E.Trise * 0.4, E.Trise * 1.1, t));
+    }
+    if (size < 0.5 || alpha <= 0.005) continue;
+    const pos = D.local(x, y, z, new Cesium.Cartesian3());
+    const k = clamp01(heat * glow), o = under * glow2 * 0.6, v = 0.95 + 0.1 * p.r4;
+    items.push({
+      pos, d: Cesium.Cartesian3.distanceSquared(pos, camPos), alpha, size, rot: p.rot + t * 0.002 * (p.r4 - 0.5),
+      c: [Math.min(1, (lerp(base[0] * shade, fc[0], k) + o) * v), Math.min(1, (lerp(base[1] * shade, fc[1], k) + o * 0.45) * v), Math.min(1, (lerp(base[2] * shade, fc[2], k) + o * 0.12) * v)],
+    });
+  }
+  items.sort((a, b) => b.d - a.d);
+  for (let i = 0; i < D.bbs.length; i++) {
+    const b = D.bbs[i], it = items[i];
+    if (!it) { b.show = false; continue; }
+    b.show = true; b.position = it.pos; b.width = b.height = it.size; b.rotation = it.rot;
+    tmpCol.red = it.c[0]; tmpCol.green = it.c[1]; tmpCol.blue = it.c[2]; tmpCol.alpha = it.alpha;
+    b.color = tmpCol;
+  }
+}
+
+// ---------- Main loop ----------
+let last = performance.now();
+scene.preRender.addEventListener(() => {
+  const now = performance.now(), dtReal = Math.min(0.1, (now - last) / 1000); last = now;
+  handleKeys(dtReal);
+  $('needle').setAttribute('transform', `rotate(${-Cesium.Math.toDegrees(camera.heading)} 17 17)`);
+  let flash = 0, warm = 0;
+  for (const D of blasts) {
+    const E = D.E;
+    D.real += dtReal;
+    const k = D.t > E.Trise * 1.3 ? 1 : 1 + (SPEED - 1) * smooth(0.8, 4.5, D.real);
+    const dtSim = D.t > E.Trise * 3 ? 0 : dtReal * k;
+    D.t += dtSim;
+    const t = D.t;
+    if (D.shock < D.maxR * 1.2) D.shock += 340 * (1 + 2.5 * E.Rfb / Math.max(D.shock, E.Rfb)) * dtSim;
+    updateCloud(D, dtSim);
+    const glow = Math.exp(-t / E.tglow);
+    flash = Math.max(flash, t < 0.04 ? 1 : 0.95 * Math.exp(-(t - 0.04) / (0.12 + 0.35 * E.tmax)));
+    warm = Math.max(warm, 0.6 * glow);
+    D.burn = smooth(0, E.tmax, t); D.glowB = 1.6 * glow;
+    setSlot(D.slot, D);
+    D.groundMat.uniforms.shock = D.shock / D.maxR;
+    D.groundMat.uniforms.glow = Math.min(0.9, 1.2 * glow);
+    D.groundMat.uniforms.burn = smooth(0, E.tmax * 2, t);
+    addRing(D, 'fb', E.Rfb, '#ffd84a');
+    if (t > E.tmax) { addRing(D, 'rad', E.rrad, '#55dd66'); addRing(D, 'th', E.rth, '#ffb84d'); }
+    if (D.shock > E.r20) addRing(D, 'p20', E.r20, '#ff3030');
+    if (D.shock > E.r5) addRing(D, 'p5', E.r5, '#ff8a2a');
+    if (D.shock > E.r1) addRing(D, 'p1', E.r1, '#7fb2ff');
+  }
+  FLASH = flash; WARM = warm;
+});
+
+window.__sim = { viewer, blasts: () => blasts.length, setArmed, setLabels };
+})();
+</script>
+</body>
+</html>
