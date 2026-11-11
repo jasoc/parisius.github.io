@@ -1,0 +1,25 @@
+<div class="scan"></div>
+
+<header>
+  <div class="title">PAGE<span>//</span>TESTER <small>v1.0</small></div>
+  <div class="meta">session 0x{{ session }} · {{ total() }} events</div>
+</header>
+
+<div class="log">
+  <div class="list" #list>
+    @for (ev of events(); track ev.id; let i = $index, last = $last) {
+      <div class="row" [class.current]="last" [style.opacity]="opacity(i, events().length)">
+        <span class="time">{{ ev.time }}</span>
+        <span class="type" [style.color]="colorOf(ev.type)">[{{ ev.type }}]</span>
+        <span class="msg">{{ ev.msg }}</span>
+      </div>
+    }
+  </div>
+  <div class="prompt"><span class="caret">▍</span> awaiting input</div>
+</div>
+
+<aside>
+  @for (c of countList(); track c.type) {
+    <div class="stat"><span [style.color]="c.color">{{ c.type }}</span><b>{{ c.n }}</b></div>
+  }
+</aside>

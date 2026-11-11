@@ -30,4 +30,18 @@ export const MINI_APPS: MiniApp[] = [
     icon: 'crisis_alert',
     src: 'mini/nuke-sim/index.html',
   },
+  {
+    path: 'page-tester',
+    title: 'Page Tester',
+    description: 'A live terminal log of everything your browser lets a page see you do: moves, clicks, keys, scrolls, copy/paste, drops, focus…',
+    icon: 'terminal',
+    load: () => import('../page-tester/page-tester').then((m) => m.PageTester),
+  },
+  {
+    path: 'pong',
+    title: 'Pong',
+    description: 'Two players, one keyboard. W/S on the left, arrow keys on the right. First to 7.',
+    icon: 'sports_esports',
+    load: () => import('../pong/pong').then((m) => m.Pong),
+  },
 ];
