@@ -1,0 +1,147 @@
+<div #map class="map"></div>
+<div class="tp-fade" [class.on]="teleporting()"></div>
+
+@if (loading()) {
+  <div class="loading"><span class="spinner"></span> loading globe…</div>
+}
+
+<!-- ============ armory ============ -->
+<aside class="panel">
+  <header>
+    <span class="brand">nuke<span>.sim</span></span>
+    <span class="prompt">$ armory</span>
+  </header>
+
+  <label class="search">
+    <mat-icon>search</mat-icon>
+    <input #q type="text" placeholder="Cerca un luogo e premi Invio" autocomplete="off" spellcheck="false" (keydown.enter)="search(q)" />
+  </label>
+
+  <section class="preview">
+    <div class="big">{{ tool().icon }}</div>
+    <div class="ptext">
+      <div class="pname">{{ tool().name }}</div>
+      <div class="pmeta">{{ toolMeta() }}</div>
+    </div>
+    <p class="pdesc">{{ tool().desc }}</p>
+  </section>
+
+  <div class="tools">
+    @for (g of groups; track g.name) {
+      <div class="group">{{ g.name }}</div>
+      <div class="grid">
+        @for (t of g.tools; track t.id) {
+          <button type="button" class="tile" [class.sel]="t.id === tool().id" (click)="pick(t)" [matTooltip]="t.desc" matTooltipPosition="right">
+            <span class="ico">{{ t.icon }}</span>
+            <span class="tn">{{ t.name }}</span>
+          </button>
+        }
+      </div>
+    }
+  </div>
+
+  <button type="button" class="drop" [class.on]="armed()" (click)="toggleArmed()" matTooltip="Modalità sgancio (D)">
+    <mat-icon>my_location</mat-icon>
+    {{ armed() ? 'DROP ATTIVO' : 'DROP' }}
+  </button>
+
+  <div class="toggles">
+    <button type="button" [class.active]="chain()" (click)="toggleChain()" matTooltip="Reazione a catena (K)"><mat-icon>link</mat-icon><span>Catena</span></button>
+    <button type="button" [class.active]="sound()" (click)="toggleSound()" matTooltip="Audio"><mat-icon>{{ sound() ? 'volume_up' : 'volume_off' }}</mat-icon><span>Audio</span></button>
+    <button type="button" [class.active]="rings()" (click)="toggleRings()" matTooltip="Raggi dei danni"><mat-icon>track_changes</mat-icon><span>Raggi</span></button>
+    <button type="button" [class.active]="labels()" (click)="toggleLabels()" matTooltip="Confini e nomi (L)"><mat-icon>map</mat-icon><span>Nomi</span></button>
+    <button type="button" (click)="clear()" matTooltip="Rimuovi tutto"><mat-icon>delete_sweep</mat-icon><span>Clear</span></button>
+  </div>
+
+  <div class="sun">
+    <mat-icon>{{ sunIcon() }}</mat-icon>
+    <mat-slider min="0" max="24" step="0.25">
+      <input matSliderThumb [value]="sunHour()" (valueChange)="setSun($event)" (input)="setSun(+$any($event.target).value)" />
+    </mat-slider>
+    <span class="time">{{ sunLabel() }}</span>
+  </div>
+
+  <div class="hint">{{ hint() }}</div>
+</aside>
+
+<!-- ============ stats ============ -->
+<div class="stats">
+  <span matTooltip="Esplosioni"><mat-icon>local_fire_department</mat-icon><b>{{ stats().count }}</b></span>
+  <span matTooltip="Area rasa al suolo (5 psi)"><mat-icon>radar</mat-icon><b>{{ areaLabel() }}</b> km²</span>
+  <span matTooltip="Fungo più alto"><mat-icon>cloud</mat-icon><b>{{ cloudLabel() }}</b> km</span>
+  <button type="button" class="trophy" (click)="showAch.set(!showAch())" matTooltip="Trofei"><mat-icon>emoji_events</mat-icon><b>{{ unlocked().size }}/{{ ach.length }}</b></button>
+</div>
+
+@if (showAch()) {
+  <div class="card ach">
+    <div class="card-title">Trofei</div>
+    @for (a of ach; track a[0]) {
+      <div class="a" [class.got]="unlocked().has(a[0])">
+        <span class="e">{{ a[1] }}</span>
+        <span><b>{{ a[2] }}</b><small>{{ a[3] }}</small></span>
+      </div>
+    }
+  </div>
+}
+
+<div class="toasts">
+  @for (t of toasts(); track t.id) {
+    <div class="toast"><span class="e">{{ t.emoji }}</span><span [innerHTML]="t.html"></span></div>
+  }
+</div>
+
+@if (status()) {
+  <div class="status">{{ status() }}</div>
+}
+
+<!-- ============ saved places ============ -->
+<div class="places">
+  @for (p of places(); track p.id) {
+    <button type="button" class="place" (click)="go(p)" [matTooltip]="'Vai a ' + p.name">
+      <img [src]="p.thumb" alt="" />
+      <span class="pl-name">{{ p.name }}</span>
+      <span class="del" (click)="remove(p, $event)" matTooltip="Elimina"><mat-icon>close</mat-icon></span>
+    </button>
+  }
+  @if (saving()) {
+    <div class="save-form">
+      <input #nm type="text" placeholder="Nome del luogo" (keydown.enter)="confirmSave(nm)" autofocus />
+      <button type="button" class="ok" (click)="confirmSave(nm)"><mat-icon>check</mat-icon></button>
+      <button type="button" (click)="saving.set(false)"><mat-icon>close</mat-icon></button>
+    </div>
+  } @else {
+    <button type="button" class="place add" (click)="startSave()" matTooltip="Salva la vista attuale">
+      <mat-icon>add_location_alt</mat-icon>
+      <span>Salva luogo</span>
+    </button>
+  }
+</div>
+
+<!-- ============ info ============ -->
+<button type="button" class="info-btn" (click)="showInfo.set(!showInfo())"><mat-icon>info</mat-icon> Dati e comandi</button>
+@if (showInfo()) {
+  <div class="card info">
+    @if (radii().length) {
+      <div class="card-title">{{ tool().name }}</div>
+      @for (r of radii(); track r[0]) {
+        <div class="r"><span><i [style.background]="r[2]"></i>{{ r[0] }}</span><b>{{ km(r[1]) }}</b></div>
+      }
+      <div class="sep"></div>
+    }
+    <div class="card-title">Comandi</div>
+    <p>Trascina: sposta · Rotella / destro: zoom<br />
+      Rotella premuta o Shift+trascina: ruota e inclina<br />
+      Ctrl+trascina: guarda intorno · Doppio clic: zoom<br />
+      <kbd>D</kbd> drop · <kbd>K</kbd> catena · <kbd>L</kbd> nomi · <kbd>Esc</kbd> esci<br />
+      <kbd>N</kbd> nord · <kbd>U</kbd> dall'alto · <kbd>R</kbd> entrambi</p>
+    <div class="sep"></div>
+    <p>Raggi stimati con le leggi di scala di Glasstone &amp; Dolan (come NUKEMAP). Asteroidi e assurdità: numeri per divertimento.</p>
+    <div class="sep"></div>
+    <p>Token Cesium ion, se la mappa non carica (gratis su <a href="https://ion.cesium.com/signup" target="_blank" rel="noopener">ion.cesium.com</a>):</p>
+    <input #tk class="token" type="text" [value]="token()" placeholder="incolla e premi Invio" (keydown.enter)="saveToken(tk.value)" />
+  </div>
+}
+
+<button type="button" class="compass" (click)="northUp()" matTooltip="Nord in alto (N)">
+  <svg viewBox="0 0 34 34" [style.transform]="'rotate(' + -heading() + 'deg)'"><path d="M17 3 L21.5 17 L12.5 17 Z" fill="#ff5f4a" /><path d="M17 31 L21.5 17 L12.5 17 Z" fill="#c9cfd8" /></svg>
+</button>

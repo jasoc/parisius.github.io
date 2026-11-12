@@ -28,7 +28,7 @@ export const MINI_APPS: MiniApp[] = [
     description:
       'Drop a nuclear weapon anywhere on a photorealistic 3D globe and watch the blast radii and the mushroom cloud, to scale.',
     icon: 'crisis_alert',
-    src: 'mini/nuke-sim/index.html',
+    load: () => import('../nuke/nuke').then((m) => m.Nuke),
   },
   {
     path: 'page-tester',
