@@ -14,6 +14,18 @@
 
 Not checked: a hilly city or coast (Milan only), a moving-camera visual check for swimming (measured by picking instead), night lighting.
 
+## Phase 1 notes (craters)
+
+- Verified in Chrome on Google tiles: Ivy Mike over Milan leaves a ~910 m bowl (depth ~180 m, rim, ejecta); the camera
+  flies inside it (tile collision turns off over sunk ground); a 90 kt ground burst picked on the floor digs its own
+  crater into it (origin lifted back by `deformAt`); a giant duck dropped in the bowl rests on the floor; Chicxulub
+  shows a ~100 km crater from orbit. Globe fallback still builds the `GroundPrimitive` decal.
+- `deformAt` mirrors only the smooth terms: the GLSL noise makes the real surface differ by up to ~±7 % of the depth.
+- Ring polylines: for a single blast every ring lies outside the ejecta blanket (`Rfb / crater ≥ 2.9`), so nothing
+  needed hiding. Rings of a blast placed inside another crater still drape over the deformed tiles; not checked.
+- The camera floor is `surfaceHeight + 15 m` in `applyZoom`. Mouse-drag zoom/orbit does not test it.
+- Not checked: a hilly city, a coast, night.
+
 Goal: when a bomb goes off, the world is physically changed. Real craters, buildings that collapse as
 the shock front passes, ground cracks, flying debris, and cumulative damage that lets Tsar-spam sink
 and crack a whole continent. Everything persists until `clear()`.

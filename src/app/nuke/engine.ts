@@ -145,6 +145,54 @@ function makePersonTex() {
 }
 
 // ---------------------------------------------------------------------------
+// Crater profile. ONE analytic field evaluated from the original surface position, written twice:
+// GLSL (vertex stage, with noise) and JS (craterZ, smooth terms only) for everything on the CPU.
+// r = distance / crater radius: bowl -Dp(1-r²) inside r<1, a raised rim around r=1, an ejecta blanket to
+// r=2.5; craters over 5 km get a flat floor and a central peak. Low air bursts press a shallow dish instead.
+// ---------------------------------------------------------------------------
+const craterDepth = (R) => Math.min(0.4 * R, 30000);
+function dishDepth(E) { return E.crater > 0 || E.hob >= E.Rfb ? 0 : Math.min(6, 0.01 * E.Rfb) * (1 - E.hob / E.Rfb); }
+function craterZ(d, E, crv) {
+  if (!(crv > 0)) return 0;
+  const R = E.crater;
+  if (R <= 0) { const dd = dishDepth(E); return dd ? -dd * crv * (1 - smooth(0, E.Rfb, d)) : 0; }
+  const r = d / R; if (r > 2.5) return 0;
+  const Dp = craterDepth(R), big = smooth(5000, 15000, R);
+  const bowl = r < 1 ? -Dp * Math.min(1, (1 - r * r) * lerp(1, 1.6, big)) : 0;
+  const rim = 0.08 * Dp * Math.exp(-(((r - 1) / 0.3) ** 2));
+  const ej = 0.03 * Dp * smooth(0.7, 1, r) * (1 - smooth(1, 2.5, r));
+  const peak = big * 0.18 * Dp * Math.exp(-((r / 0.12) ** 2));
+  return (bowl + rim + ej + peak) * crv;
+}
+const GLSL_COMMON = `
+  float h21(vec2 p) { p = fract(p * vec2(123.34, 456.21)); p += dot(p, p + 45.32); return fract(p.x * p.y); }
+  float vn(vec2 p) {
+    vec2 i = floor(p), f = fract(p); f = f * f * (3.0 - 2.0 * f);
+    return mix(mix(h21(i), h21(i + vec2(1.0, 0.0)), f.x), mix(h21(i + vec2(0.0, 1.0)), h21(i + 1.0), f.x), f.y);
+  }
+  // vertical offset (m) of the original surface at blast-local xy; must match craterZ() in engine.ts (minus noise)
+  float craterZ(vec2 xy, float R, float crv, float seed, float Rfb, float hob) {
+    float d = length(xy);
+    if (R <= 0.0) {
+      if (hob >= Rfb || d > Rfb) return 0.0;
+      return -min(6.0, 0.01 * Rfb) * (1.0 - hob / Rfb) * crv * (1.0 - smoothstep(0.0, Rfb, d));
+    }
+    float r = d / R;
+    if (r > 2.5) return 0.0;
+    float Dp = min(0.4 * R, 30000.0), big = smoothstep(5000.0, 15000.0, R);
+    float bowl = r < 1.0 ? -Dp * min(1.0, (1.0 - r * r) * mix(1.0, 1.6, big)) : 0.0;
+    float rim = 0.08 * Dp * exp(-pow((r - 1.0) / 0.3, 2.0));
+    float ej = 0.03 * Dp * smoothstep(0.7, 1.0, r) * (1.0 - smoothstep(1.0, 2.5, r));
+    float peak = big * 0.18 * Dp * exp(-pow(r / 0.12, 2.0));
+    // lumpy rim and floor: two octaves of noise in crater units, seeded per blast
+    vec2 q = xy / R + seed;
+    float n = (vn(q * 3.0) - 0.5) + 0.4 * (vn(q * 11.0) - 0.5);
+    float lump = 0.12 * Dp * n * (1.0 - smoothstep(1.3, 2.5, r)) * smoothstep(0.0, 0.5, r + big);
+    return (bowl + rim + ej + peak + lump) * crv;
+  }
+`;
+
+// ---------------------------------------------------------------------------
 // Tile culling vs. vertex displacement: Cesium culls tiles with their ORIGINAL bounding boxes, so a tile sunk
 // into a crater vanishes as soon as its old box leaves the view (camera inside the pit looking down).
 // We wrap Cesium3DTile.updateVisibility (private API, checked on 1.146) and stretch each tile's box over the
@@ -276,9 +324,11 @@ export class NukeEngine {
 
   padGen = 1;
   /** how far a blast can move geometry: { reach (m from ground zero), down (m), side (m) }; see installCullPad */
-  private padOf(D) { const s = this.spike || 0; return { reach: 650, down: s, side: 0 }; }
-  private spike = 0;
-  setSpike(m) { this.spike = m; this.bShader.setUniform('u_spike', m); this.padGen++; this.poke(); }
+  private padOf(D) {
+    const E = D.E, R = E.crater, Dp = Math.min(0.4 * R, 30000), dish = dishDepth(E);
+    if (R > 0) return { reach: 2.5 * R, down: Dp * 1.1, side: 0.15 * Dp + 5 };
+    return { reach: E.Rfb, down: dish, side: 0 };
+  }
   padTile(tile) {
     if (tile.__pg === this.padGen) return;
     tile.__pg = this.padGen;
@@ -306,6 +356,23 @@ export class NukeEngine {
     }
   }
 
+  // ---- deformation, CPU mirror of the vertex shader (smooth terms only, no noise) ----
+  /** vertical offset (m, + up) of the ORIGINAL surface at world point P, summed over blasts */
+  deformAt(P) {
+    let z = 0;
+    for (const D of this.blasts) {
+      const l = Cesium.Matrix4.multiplyByPoint(D.invEnu, P, this._sc || (this._sc = new Cesium.Cartesian3()));
+      z += craterZ(Math.hypot(l.x, l.y), D.E, D.crv);
+    }
+    return Math.max(z, -60000);
+  }
+  /** Height of the (deformed) surface: the single choke point for everything that stands on the ground. */
+  surfaceHeight(carto) {
+    let h; try { h = this.scene.sampleHeight(carto); } catch {}
+    if (h === undefined) return undefined;
+    return h + this.deformAt(Cesium.Cartographic.toCartesian(new Cesium.Cartographic(carto.longitude, carto.latitude, h)));
+  }
+
   private MAX = 16;
   private setupShader() {
     const U = Cesium.UniformType, uniforms = {};
@@ -314,38 +381,71 @@ export class NukeEngine {
       // u_m = inverse(blast ENU) * inverse(view), built in doubles every frame: eye coords -> blast-local metres,
       // precise near the blast (float32 world coords are only good to ~0.5 m)
       uniforms['u_m' + i] = { type: U.MAT4, value: new Cesium.Matrix4() };
-      uniforms['u_a' + i] = { type: U.VEC4, value: new Cesium.Cartesian4() };
-      uniforms['u_b' + i] = { type: U.VEC4, value: new Cesium.Cartesian4(0, 0, 0, 1) };
-      calls += `fx(pEC, u_m${i}, u_a${i}, u_b${i}, tint, material);\n`;
-      vcalls += `dEC += vfx(pEC, u_m${i}, u_a${i});\n`;
+      uniforms['u_a' + i] = { type: U.VEC4, value: new Cesium.Cartesian4() }; // shock, r20, r5, r1
+      uniforms['u_b' + i] = { type: U.VEC4, value: new Cesium.Cartesian4(0, 0, 0, 1) }; // rth, burn, glowB, glow radius
+      uniforms['u_d' + i] = { type: U.VEC4, value: new Cesium.Cartesian4() }; // crater radius, crater progress, heat, seed
+      uniforms['u_e' + i] = { type: U.VEC4, value: new Cesium.Cartesian4() }; // atlas idx, atlas half-extent, collapse, hob
+      calls += `fx(pEC, u_m${i}, u_a${i}, u_b${i}, u_d${i}, u_e${i}, tint, material);\n`;
+      vcalls += `dEC += vfx(pEC, u_m${i}, u_a${i}, u_b${i}, u_d${i}, u_e${i});\n`;
     }
-    uniforms.u_spike = { type: U.FLOAT, value: 0 };
+    uniforms.u_rings = { type: U.FLOAT, value: this.showRings ? 1 : 0 };
     this.bShader = new Cesium.CustomShader({
       uniforms,
-      vertexShaderText: `
+      vertexShaderText: GLSL_COMMON + `
       // displacement of one blast, in eye coordinates (summed over blasts, then taken back to model space)
-      vec3 vfx(vec3 pEC, mat4 M, vec4 a) {
-        if (a.y <= 0.0 || u_spike <= 0.0) return vec3(0.0);
+      vec3 vfx(vec3 pEC, mat4 M, vec4 a, vec4 b, vec4 dd, vec4 e) {
+        if (a.y <= 0.0 || dd.y <= 0.0) return vec3(0.0);
         vec3 l = (M * vec4(pEC, 1.0)).xyz;
-        float d = length(l.xy);
-        if (d > 600.0) return vec3(0.0);
-        vec3 v = vec3(0.0, 0.0, -u_spike * (1.0 - smoothstep(400.0, 500.0, d)));
-        return transpose(mat3(M)) * v;
+        float z = craterZ(l.xy, dd.x, dd.y, dd.w, max((b.w - e.w) / 3.0, 1.0), e.w);
+        return z == 0.0 ? vec3(0.0) : transpose(mat3(M)) * vec3(0.0, 0.0, z);
       }
       void vertexMain(VertexInput vsInput, inout czm_modelVertexOutput vsOutput) {
         vec3 pEC = (czm_modelView * vec4(vsOutput.positionMC, 1.0)).xyz;
         vec3 dEC = vec3(0.0);
         ${vcalls}
+        // overlapping craters add up; never deeper than ~60 km
+        float L = length(dEC);
+        if (L > 60000.0) dEC *= 60000.0 / L;
         vsOutput.positionMC += mat3(czm_inverseModelView) * dEC;
       }`,
-      fragmentShaderText: `
-      void fx(vec3 pEC, mat4 M, vec4 a, vec4 b, vec3 tint, inout czm_modelMaterial m) {
+      fragmentShaderText: GLSL_COMMON + `
+      void fx(vec3 pEC, mat4 M, vec4 a, vec4 b, vec4 dd, vec4 e, vec3 tint, inout czm_modelMaterial m) {
         if (a.y <= 0.0) return;
         vec3 l = (M * vec4(pEC, 1.0)).xyz;
-        float d = length(l.xy);
+        float d = length(l.xy), maxR = a.w * 1.15;
+        if (d > maxR * 1.05) return;
+        // blast darkening behind the front (as before)
         float lim = min(a.x, a.z);
         float k = (1.0 - smoothstep(lim * 0.85, lim, d)) * mix(0.55, 0.9, 1.0 - smoothstep(a.y * 0.7, a.y * 1.2, d));
         m.diffuse = mix(m.diffuse, vec3(0.1, 0.08, 0.065) * tint, k);
+        // the old ground decal, now on the tiles themselves (a classification volume cannot reach a crater floor)
+        float Rfb = max((b.w - e.w) / 3.0, 1.0), burn = b.y;
+        float scorch = burn * (0.45 * (1.0 - smoothstep(Rfb * 0.8, Rfb * 3.0, d)) + 0.2 * (1.0 - smoothstep(b.x * 0.85, b.x, d)));
+        m.diffuse = mix(m.diffuse, vec3(0.07, 0.05, 0.035) * tint, clamp(scorch, 0.0, 0.95));
+        float R = dd.x;
+        if (R > 0.0 && dd.y > 0.0 && d < R * 2.5) {
+          float r = d / R, crv = dd.y;
+          vec2 q = l.xy / R + dd.w;
+          float n = vn(q * 3.0), n2 = vn(q * 18.0);
+          float ej = crv * 0.45 * smoothstep(0.95, 1.1, r) * (1.0 - smoothstep(1.2, 2.5, r + 0.3 * (n - 0.5)));
+          m.diffuse = mix(m.diffuse, vec3(0.17, 0.145, 0.115) * tint * (0.75 + 0.5 * n2), ej);
+          float rim = crv * smoothstep(0.8, 1.0, r) * (1.0 - smoothstep(1.0, 1.35, r));
+          m.diffuse = mix(m.diffuse, vec3(0.24, 0.2, 0.155) * tint * (0.8 + 0.4 * n), rim * 0.7);
+          // the bowl: dark vitrified glass with a faint sheen, glowing while hot
+          float bowl = crv * (1.0 - smoothstep(0.85, 1.0, r));
+          vec3 glass = mix(vec3(0.022, 0.02, 0.024), vec3(0.07, 0.065, 0.07), n2 * n2) * tint;
+          m.diffuse = mix(m.diffuse, glass, bowl * 0.95);
+          float heat = dd.z * bowl * (1.0 - smoothstep(0.3, 0.95, r));
+          m.emissive += vec3(1.0, 0.36, 0.08) * heat * (0.35 + 0.9 * smoothstep(0.45, 0.8, vn(q * 7.0)));
+        }
+        // shock ring travelling outward (ring toggle)
+        float sh = a.x / maxR;
+        if (u_rings > 0.0 && sh > 0.001) {
+          float rr = d / maxR;
+          float ring = smoothstep(sh - 0.035, sh, rr) * (1.0 - smoothstep(sh, sh + 0.006, rr)) * (1.0 - smoothstep(0.75, 1.0, sh));
+          m.diffuse = mix(m.diffuse, vec3(1.0, 0.8, 0.55), ring * 0.5);
+          m.emissive += vec3(1.0, 0.7, 0.4) * ring * 0.25;
+        }
         m.diffuse += vec3(1.0, 0.55, 0.2) * b.z / (1.0 + pow(d / b.w, 2.0));
       }
       void fragmentMain(FragmentInput fsInput, inout czm_modelMaterial material) {
@@ -556,7 +656,10 @@ export class NukeEngine {
       nd = lo; pos = at(nd);
       this.zoomPending = 0;
     }
-    if (Cesium.Cartographic.fromCartesian(pos).height < 15) { this.zoomPending = 0; return; }
+    // never below the (deformed) surface: tile collision only knows the original geometry, the ellipsoid even less
+    const pc = Cesium.Cartographic.fromCartesian(pos);
+    const floor = (this.surfaceHeight(pc) ?? this.deformAt(Cesium.Cartographic.toCartesian(new Cesium.Cartographic(pc.longitude, pc.latitude, 0)))) + 15;
+    if (pc.height < floor) { this.zoomPending = 0; return; }
     cam.setView({ destination: pos, orientation: { heading: cam.heading, pitch: cam.pitch, roll: cam.roll } });
   }
 
@@ -597,7 +700,8 @@ export class NukeEngine {
   setSound(v: boolean) { this.soundOn = v; if (v) this.audio(); }
   setRings(v: boolean) {
     this.showRings = v;
-    for (const D of this.blasts) { D.entities.forEach((e) => (e.show = v)); D.groundMat.uniforms.rings = v ? 1 : 0; }
+    for (const D of this.blasts) { D.entities.forEach((e) => (e.show = v)); if (D.groundMat) D.groundMat.uniforms.rings = v ? 1 : 0; }
+    this.bShader.setUniform('u_rings', v ? 1 : 0);
     this.poke();
   }
   private removeBase() {
@@ -822,9 +926,11 @@ export class NukeEngine {
     s.setUniform('u_m' + slot, D ? Cesium.Matrix4.multiply(D.invEnu, this.camera.inverseViewMatrix, new Cesium.Matrix4()) : new Cesium.Matrix4());
     s.setUniform('u_a' + slot, D ? new Cesium.Cartesian4(D.shock, D.E.r20, D.E.r5, D.E.r1) : new Cesium.Cartesian4());
     s.setUniform('u_b' + slot, D ? new Cesium.Cartesian4(D.E.rth, D.burn, D.glowB, D.E.Rfb * 3 + D.E.hob) : new Cesium.Cartesian4(0, 0, 0, 1));
+    s.setUniform('u_d' + slot, D ? new Cesium.Cartesian4(D.E.crater, D.crv, D.heat, D.seed) : new Cesium.Cartesian4());
+    s.setUniform('u_e' + slot, D ? new Cesium.Cartesian4(-1, 0, 0, D.E.hob) : new Cesium.Cartesian4());
   }
   private removeBlast(D) {
-    this.scene.primitives.remove(D.ground);
+    if (D.ground) this.scene.primitives.remove(D.ground);
     D.entities.forEach((e) => this.viewer.entities.remove(e));
     this.setSlot(D.slot, null);
     this.blasts = this.blasts.filter((b) => b !== D); this.padGen++;
@@ -857,9 +963,15 @@ export class NukeEngine {
       puffs: this.makePuffs(E, gen ? 0.55 : 1), heard: false, gen, children: [],
     };
     D.root = opts.root || D;
-    D.invEnu = Cesium.Matrix4.inverseTransformation(enu, new Cesium.Matrix4());
+    // The shader evaluates every blast from the ORIGINAL surface, but pickPosition sees the deformed one:
+    // a bomb dropped on a crater floor gets its origin moved back up to where that floor was.
+    const sunk = this.deformAt(groundPos);
+    D.origin = C3.add(groundPos, C3.multiplyByScalar(D.up, -sunk, new C3()), new C3());
+    D.invEnu = Cesium.Matrix4.inverseTransformation(Cesium.Transforms.eastNorthUpToFixedFrame(D.origin), new Cesium.Matrix4());
+    D.crv = 0; D.heat = 1; D.seed = Math.random() * 97;
     D.maxR = E.r1 * 1.15;
-    D.groundMat = new Cesium.Material({
+    // the ground decal is only needed on the globe fallback: on the 3D tiles the tile shader draws all of it
+    if (!this.tileset) D.groundMat = new Cesium.Material({
       fabric: {
         uniforms: { shock: 0, glow: 0, burn: 0, rings: this.showRings ? 1 : 0, rth: E.rth / D.maxR, rfb: E.Rfb / D.maxR, cr: E.crater / D.maxR, crv: 0 },
         source: `
@@ -881,7 +993,7 @@ export class NukeEngine {
         }`,
       },
     });
-    D.ground = this.scene.primitives.add(new Cesium.GroundPrimitive({
+    if (D.groundMat) D.ground = this.scene.primitives.add(new Cesium.GroundPrimitive({
       geometryInstances: new Cesium.GeometryInstance({ geometry: new Cesium.EllipseGeometry({ center: groundPos, semiMajorAxis: D.maxR, semiMinorAxis: D.maxR }) }),
       appearance: new Cesium.MaterialAppearance({ material: D.groundMat, translucent: true, flat: true }),
       asynchronous: false,
@@ -1028,9 +1140,10 @@ export class NukeEngine {
     D.flash = t < 0.04 ? 1 : 0.95 * Math.exp(-(t - 0.04) / (0.12 + 0.35 * E.tmax));
     D.warm = 0.6 * glow * (1 + night);
     D.burn = smooth(0, E.tmax, t); D.glowB = 1.6 * glow * (1 + 1.5 * night);
+    D.crv = smooth(E.tmax * 0.5, E.tmax * 3 + 1, t);
+    const heat = Math.exp(-t / (8 * E.tglow)); D.heat = heat < 0.01 ? 0 : heat; // glowing crater floor (cracks too, later)
     this.setSlot(D.slot, D);
-    const u = D.groundMat.uniforms;
-    u.shock = D.shock / D.maxR; u.glow = Math.min(0.9, 1.2 * glow); u.burn = smooth(0, E.tmax * 2, t); u.crv = smooth(E.tmax * 0.5, E.tmax * 3 + 1, t);
+    if (D.groundMat) { const u = D.groundMat.uniforms; u.shock = D.shock / D.maxR; u.glow = Math.min(0.9, 1.2 * glow); u.burn = smooth(0, E.tmax * 2, t); u.crv = D.crv; }
     this.addRing(D, 'fb', E.Rfb, '#ffd84a');
     if (t > E.tmax) { this.addRing(D, 'rad', E.rrad, '#55dd66'); this.addRing(D, 'th', E.rth, '#ffb84d'); }
     if (D.shock > E.r20) this.addRing(D, 'p20', E.r20, '#ff3030');
@@ -1050,8 +1163,7 @@ export class NukeEngine {
       if (ch.done || D.shock < ch.dist) continue;
       ch.done = true;
       const carto = Cesium.Cartographic.fromCartesian(D.local(ch.dist * Math.cos(ch.a), ch.dist * Math.sin(ch.a), 0));
-      let h; try { h = this.scene.sampleHeight(carto); } catch {}
-      carto.height = h ?? Cesium.Cartographic.fromCartesian(D.groundPos).height;
+      carto.height = this.surfaceHeight(carto) ?? Cesium.Cartographic.fromCartesian(D.groundPos).height;
       this.detonate(Cesium.Cartographic.toCartesian(carto), { ...D.w, W: ch.W, id: undefined }, { gen: D.gen + 1, root: D.root });
     }
   }
@@ -1121,8 +1233,7 @@ export class NukeEngine {
   }
 
   private groundAt(carto, fallbackH) {
-    let h; try { h = this.scene.sampleHeight(carto); } catch {}
-    carto.height = h ?? fallbackH;
+    carto.height = this.surfaceHeight(carto) ?? fallbackH;
     return Cesium.Cartographic.toCartesian(carto);
   }
 
@@ -1617,6 +1728,8 @@ export class NukeEngine {
     this.applyZoom(dt);
     this.recenter(dt);
     this.updateSun();
+    // tile collision would stop the camera at the ORIGINAL surface, i.e. above a crater: off over sunk ground
+    if (this.tileset) this.tileset.enableCollision = !(this.blasts.length && this.deformAt(this.camera.positionWC) < -10);
     const hd = Cesium.Math.toDegrees(this.camera.heading);
     if (Math.abs(hd - this.lastHeading) > 0.5) { this.lastHeading = hd; this.ev.heading(hd); }
     this.noDepth(this.puffs); Object.values(this.cols).forEach((c) => this.noDepth(c));
