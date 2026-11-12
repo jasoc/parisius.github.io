@@ -35,6 +35,9 @@ export const TOOLS: Tool[] = [
   ...t('Missiles & guns', [
     { id: 'cruise', name: 'Cruise missile', icon: '🛩️', kind: 'cruise', W: 0.00045, air: false, desc: 'Comes in low from behind you (or from your silo in launch mode). Conventional warhead.' },
     { id: 'railgun', name: 'Railgun', icon: '⚡', kind: 'railgun', W: 0.003, air: false, desc: 'Place up to 4 turrets: they fire Mach 7 slugs on their own within 15 km.' },
+    { id: 'fpv', name: 'FPV drone', icon: '🛸', kind: 'cruise', W: 0.000001, air: false, desc: 'Kamikaze drone, 1 kg: takes a bite out of a wall.' },
+    { id: 'rpg', name: 'RPG-7', icon: '🎯', kind: 'cruise', W: 0.000002, air: false, desc: 'Shoulder-fired rocket.' },
+    { id: 'javelin', name: 'Javelin', icon: '🎯', kind: 'cruise', W: 0.000009, air: false, desc: 'Top-attack anti-tank missile.' },
     { id: 'hellfire', name: 'Hellfire', icon: '🎯', kind: 'cruise', W: 0.000009, air: false, desc: 'Small drone-launched anti-tank missile.' },
     { id: 'gmlrs', name: 'GMLRS rocket', icon: '🚀', kind: 'cruise', W: 0.00009, air: false, desc: 'Guided artillery rocket, 90 kg warhead.' },
     { id: 'brahmos', name: 'BrahMos', icon: '🚀', kind: 'cruise', W: 0.0003, air: false, desc: 'Supersonic cruise missile.' },

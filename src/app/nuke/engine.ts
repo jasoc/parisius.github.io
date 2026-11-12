@@ -211,6 +211,11 @@ function filt2(src, N, r, op) {
 }
 const GLSL_COMMON = `
   float h21(vec2 p) { p = fract(p * vec2(123.34, 456.21)); p += dot(p, p + 45.32); return fract(p.x * p.y); }
+  float vn(vec2 p);
+  // damage reaches further along some directions than others: lobed, not a compass circle
+  float warpD(vec2 xy, float d, float R, float seed) {
+    return d * (1.0 + 0.34 * (vn(xy / (0.22 * R + 1.0) + seed) - 0.5) + 0.14 * (vn(xy / (0.07 * R + 1.0) + seed * 1.7) - 0.5));
+  }
   float vn(vec2 p) {
     vec2 i = floor(p), f = fract(p); f = f * f * (3.0 - 2.0 * f);
     return mix(mix(h21(i), h21(i + vec2(1.0, 0.0)), f.x), mix(h21(i + vec2(0.0, 1.0)), h21(i + 1.0), f.x), f.y);
@@ -222,7 +227,7 @@ const GLSL_COMMON = `
       if (hob >= Rfb || d > Rfb) return 0.0;
       return -min(6.0, 0.01 * Rfb) * (1.0 - hob / Rfb) * crv * (1.0 - smoothstep(0.0, Rfb, d));
     }
-    float r = d / R;
+    float r = d / R * (1.0 + 0.16 * (vn(xy / (0.5 * R) + seed * 2.3) - 0.5)); // lobed rim
     if (r > 2.5) return 0.0;
     float Dp = min(0.4 * R, 30000.0), big = smoothstep(5000.0, 15000.0, R);
     float bowl = r < 1.0 ? -Dp * min(1.0, (1.0 - r * r) * mix(1.0, 1.6, big)) : 0.0;
@@ -297,10 +302,12 @@ const GLSL_COLLAPSE = `
     float d = length(l.xy);
     if (d > a.z || d > e.y) return;
     float h = l.z + d * d / (2.0 * 6371000.0);
-    float above = h - bareEarth(l.xy, e.x, e.y) - 3.0; // the estimate runs a few metres low: spare the streets
+    float above = h - bareEarth(l.xy, e.x, e.y) - 3.0;
+    if (dd.x < 0.0) return; // a hit on a wall: only its own bite, no column collapse // the estimate runs a few metres low: spare the streets
     if (above <= 0.0) return;
     float terrain = 1.0 - smoothstep(250.0, 400.0, above); // hundreds of metres "above ground" is a hill, not a tower
-    float s = 1.0 - smoothstep(a.y, a.z, d);
+    float gz = bareEarth(l.xy, e.x, e.y);
+    float s = 1.0 - smoothstep(a.y, a.z, warpD(l.xy, d, a.z, dd.w) + 2.5 * max(0.0, gz)); // lobed, shielded by rises
     // "blocks" are smooth ~35 m noise cells, not a hard hash: a building split between two cells would otherwise
     // keep one half standing and drag the other down into a stretched curtain
     vec2 q = l.xy / 35.0 + dd.w;
@@ -463,6 +470,7 @@ export class NukeEngine {
     const E = D.X, R = E.crater, Dp = Math.min(0.4 * R, 30000), dish = dishDepth(E);
     const p = R > 0 ? { reach: 2.5 * R, down: Dp * 1.1, side: 0.15 * Dp + 5 } : { reach: E.Rfb, down: dish, side: 0 };
     if (D.hm) { p.reach = Math.max(p.reach, E.r5); p.side = Math.max(p.side, 40); } // leaning blocks
+    if (D.bite) p.side = Math.max(p.side, 1.2 * Dp); // a wall bite goes sideways
     return p;
   }
   padTile(tile) {
@@ -505,7 +513,7 @@ export class NukeEngine {
     let z = 0;
     for (const D of this.blasts) {
       const l = Cesium.Matrix4.multiplyByPoint(D.invEnu, P, this._sc || (this._sc = new Cesium.Cartesian3()));
-      z += craterZ(Math.hypot(l.x, l.y), D.X, D.crv);
+      if (!D.bite) z += craterZ(Math.hypot(l.x, l.y), D.X, D.crv);
     }
     if (this.maxStress > 6) z -= this.subsAt(Cesium.Cartographic.fromCartesian(P));
     return Math.max(z, -60000);
@@ -784,7 +792,11 @@ export class NukeEngine {
       vec3 vfx(vec3 pEC, mat4 M, vec4 a, vec4 b, vec4 dd, vec4 e) {
         if (a.y <= 0.0 || dd.y <= 0.0) return vec3(0.0);
         vec3 l = (M * vec4(pEC, 1.0)).xyz;
-        float z = craterZ(l.xy, dd.x, dd.y, dd.w, max((b.w - e.w) / 3.0, 1.0), e.w);
+        float R = abs(dd.x);
+        float z = craterZ(l.xy, R, dd.y, dd.w, max((b.w - e.w) / 3.0, 1.0), e.w);
+        // dd.x < 0: the frame's z is the hit surface's normal (a wall): bite only what is near it, not the
+        // whole column behind (the far facade, other floors)
+        if (dd.x < 0.0) z *= 1.0 - smoothstep(0.5 * R, 1.1 * R, abs(l.z + 0.3 * R));
         return z == 0.0 ? vec3(0.0) : transpose(mat3(M)) * vec3(0.0, 0.0, z);
       }
       void vertexMain(VertexInput vsInput, inout czm_modelVertexOutput vsOutput) {
@@ -810,24 +822,30 @@ export class NukeEngine {
         vsOutput.positionMC += mat3(czm_inverseModelView) * (dEC + bestEC);
       }`,
       fragmentShaderText: get + GLSL_COMMON + `
-      void fx(vec3 pEC, mat4 M, vec4 a, vec4 b, vec4 dd, vec4 e, vec3 tint, inout czm_modelMaterial m,
+      void fx(vec3 pEC, vec3 nEC, mat4 M, vec4 a, vec4 b, vec4 dd, vec4 e, vec3 tint, inout czm_modelMaterial m,
               inout vec4 ck, inout vec4 ck2, inout vec2 ckXY, inout vec3 ckUp) {
         if (a.y <= 0.0) return;
         vec3 l = (M * vec4(pEC, 1.0)).xyz;
         float d = length(l.xy), maxR = a.w * 1.15;
         if (d > maxR * 1.05) return;
         ck2.z = max(ck2.z, 1.0 - smoothstep(0.9 * a.w, 1.1 * a.w, d)); // this slot draws its own scar out to r1
+        float d0 = d;
+        d = warpD(l.xy, d, a.z, dd.w);
+        // thermal shadows: what faces away from the fireball is not scorched (the Hiroshima shadows)
+        float Rfb0 = max((b.w - e.w) / 3.0, 1.0);
+        vec3 nL = normalize(mat3(M) * nEC), toF = normalize(vec3(0.0, 0.0, e.w + 0.3 * Rfb0) - l);
+        float lit = mix(0.2, 1.0, smoothstep(-0.05, 0.3, dot(nL, toF)));
         // blast darkening behind the front (as before)
         float lim = min(a.x, a.z);
         float k = (1.0 - smoothstep(lim * 0.85, lim, d)) * mix(0.55, 0.9, 1.0 - smoothstep(a.y * 0.7, a.y * 1.2, d));
         m.diffuse = mix(m.diffuse, vec3(0.1, 0.08, 0.065) * tint, k);
         // the old ground decal, now on the tiles themselves (a classification volume cannot reach a crater floor)
         float Rfb = max((b.w - e.w) / 3.0, 1.0), burn = b.y;
-        float scorch = burn * (0.45 * (1.0 - smoothstep(Rfb * 0.8, Rfb * 3.0, d)) + 0.2 * (1.0 - smoothstep(b.x * 0.85, b.x, d)));
+        float scorch = lit * burn * (0.45 * (1.0 - smoothstep(Rfb * 0.8, Rfb * 3.0, d)) + 0.2 * (1.0 - smoothstep(b.x * 0.85, b.x, d)));
         m.diffuse = mix(m.diffuse, vec3(0.07, 0.05, 0.035) * tint, clamp(scorch, 0.0, 0.95));
-        float R = dd.x;
-        if (R > 0.0 && dd.y > 0.0 && d < R * 2.5) {
-          float r = d / R, crv = dd.y;
+        float R = abs(dd.x);
+        if (R > 0.0 && dd.y > 0.0 && d0 < R * 2.5) {
+          float r = d0 / R * (1.0 + 0.16 * (vn(l.xy / (0.5 * R) + dd.w * 2.3) - 0.5)), crv = dd.y;
           vec2 q = l.xy / R + dd.w;
           float n = vn(q * 3.0), n2 = vn(q * 18.0);
           float ej = crv * 0.45 * smoothstep(0.95, 1.1, r) * (1.0 - smoothstep(1.2, 2.5, r + 0.3 * (n - 0.5)));
@@ -850,7 +868,7 @@ export class NukeEngine {
           m.diffuse = mix(m.diffuse, vec3(1.0, 0.8, 0.55), ring * 0.5);
           m.diffuse += vec3(1.0, 0.7, 0.4) * ring * 0.25;
         }
-        m.diffuse += vec3(1.0, 0.55, 0.2) * b.z / (1.0 + pow(d / b.w, 2.0));
+        m.diffuse += vec3(1.0, 0.55, 0.2) * b.z * lit / (1.0 + pow(d / b.w, 2.0));
         // ground cracks: strongest from the crater rim out to r20, gone by r5; ground bursts far more than air bursts.
         // Only the strongest blast's field is kept (its precise local frame also carries the shared crack web).
         float gf = R > 0.0 ? 1.0 : 0.35 * (1.0 - smoothstep(Rfb, 4.0 * Rfb, e.w));
@@ -882,9 +900,10 @@ export class NukeEngine {
         vec3 dpx = dFdx(pEC), dpy = dFdy(pEC);
         float px = max(max(length(dpx), length(dpy)), 1e-3);
         vec3 nEC = normalize(cross(dpx, dpy));
+        if (dot(nEC, -pEC) < 0.0) nEC = -nEC; // what we see faces us: the outward normal
         vec4 ck = vec4(0.0), ck2 = vec4(0.0); vec2 ckXY = vec2(0.0); vec3 ckUp = vec3(0.0, 0.0, 1.0);
         int n = int(u_n);
-        for (int i = 0; i < n; i++) fx(pEC, sM(i), sA(i), sB(i), sD(i), sE(i), tint, material, ck, ck2, ckXY, ckUp);
+        for (int i = 0; i < n; i++) fx(pEC, nEC, sM(i), sA(i), sB(i), sD(i), sE(i), tint, material, ck, ck2, ckXY, ckUp);
         // collapsed buildings: the stretched photo turns into rubble (burnt in the fire zone); soot on standing walls
         float col = v_col.x, abv = v_col.y, fire = v_col.z;
         if (col > 0.02) {
@@ -1466,8 +1485,21 @@ export class NukeEngine {
     s.setUniform('u_m' + slot, D ? Cesium.Matrix4.multiply(D.invEnu, this.camera.inverseViewMatrix, new Cesium.Matrix4()) : new Cesium.Matrix4());
     s.setUniform('u_a' + slot, D ? new Cesium.Cartesian4(D.shock, D.X.r20, D.X.r5, D.X.r1) : new Cesium.Cartesian4());
     s.setUniform('u_b' + slot, D ? new Cesium.Cartesian4(D.E.rth, D.burn, D.glowB, D.E.Rfb * 3 + D.E.hob) : new Cesium.Cartesian4(0, 0, 0, 1));
-    s.setUniform('u_d' + slot, D ? new Cesium.Cartesian4(D.X.crater, D.crv, D.heat, D.seed) : new Cesium.Cartesian4());
+    s.setUniform('u_d' + slot, D ? new Cesium.Cartesian4(D.bite ? -D.X.crater : D.X.crater, D.crv, D.heat, D.seed) : new Cesium.Cartesian4());
     s.setUniform('u_e' + slot, D ? new Cesium.Cartesian4(D.hm ? D.slot : -1, D.hmS || 0, D.cshock, D.E.hob) : new Cesium.Cartesian4(-1, 0, 0, 0));
+  }
+  /** normal of the rendered surface at P (from the depth buffer around it), facing the camera; null if unknown */
+  private surfNormal(P) {
+    const C3 = Cesium.Cartesian3, w = Cesium.SceneTransforms.worldToWindowCoordinates(this.scene, P);
+    if (!w || !this.scene.pickPositionSupported) return null;
+    const pk = (dx, dy) => this.scene.pickPosition(new Cesium.Cartesian2(w.x + dx, w.y + dy));
+    const a = pk(-3, 0), b = pk(3, 0), c = pk(0, -3), d = pk(0, 3);
+    if (!a || !b || !c || !d) return null;
+    const n = C3.cross(C3.subtract(b, a, new C3()), C3.subtract(d, c, new C3()), new C3());
+    if (C3.magnitude(n) < 1e-9) return null;
+    C3.normalize(n, n);
+    if (C3.dot(n, C3.subtract(this.camera.positionWC, P, new C3())) < 0) C3.negate(n, n);
+    return n;
   }
   /** an old blast gives up its animation layers; the scar (crater, rubble, cracks, heightmap) stays */
   private retire(D) {
@@ -1552,6 +1584,21 @@ export class NukeEngine {
     D.origin = C3.add(groundPos, C3.multiplyByScalar(D.up, -sunk, new C3()), new C3());
     D.invEnu = Cesium.Matrix4.inverseTransformation(Cesium.Transforms.eastNorthUpToFixedFrame(D.origin), new Cesium.Matrix4());
     D.crv = 0; D.heat = 1; D.seed = Math.random() * 97; D.cshock = 0; D.X = damageOf(E);
+    if (opts.mini) {
+      // small warheads damage PART of a building: a bite ~2.2 m x cbrt(kg TNT), oriented on the surface that
+      // was hit. On a wall the frame turns so its z is the wall's normal; collapse only for >= 1 t on the ground
+      // (the mini yield is already ~92x the real warhead, for collapse: the bite uses the real one)
+      const kg = (w.W * 1e6) / 92, R = 3 * Math.cbrt(kg); D.X.crater = R; // FPV ~3 m, Hellfire ~6 m, cruise ~23 m
+      const n = this.surfNormal(groundPos);
+      if (n && C3.dot(n, D.up) < 0.7) {
+        D.bite = true; D.origin = C3.clone(groundPos);
+        let x = C3.cross(D.up, n, new C3()); if (C3.magnitude(x) < 1e-6) x = new C3(1, 0, 0); C3.normalize(x, x);
+        const y = C3.cross(n, x, new C3()), F = new Cesium.Matrix4(x.x, y.x, n.x, groundPos.x, x.y, y.y, n.y, groundPos.y, x.z, y.z, n.z, groundPos.z, 0, 0, 0, 1);
+        D.invEnu = Cesium.Matrix4.inverseTransformation(F, new Cesium.Matrix4());
+      }
+      D.noCollapse = D.bite || kg < 300;
+      if (D.noCollapse) { D.X.r20 = 1.5 * R; D.X.r5 = 3 * R; D.X.r1 = 3.5 * R; } // scorch and cracks stay around the bite
+    }
     D.maxR = E.r1 * 1.15;
     // the ground decal is only needed on the globe fallback: on the 3D tiles the tile shader draws all of it
     if (!this.tileset) D.groundMat = new Cesium.Material({
@@ -1585,7 +1632,7 @@ export class NukeEngine {
     // only the newest 16 keep their animation layers (clouds, rings, globe decal), like the old 16-blast cap did
     const big = this.blasts.filter((b) => !b.mini), old = opts.mini ? null : big[big.length - 1 - this.MAX]; // minis never push a nuke's cloud out
     if (old) this.retire(old);
-    this.startHeightmap(D);
+    if (!D.noCollapse) this.startHeightmap(D);
     this.schedule(true);
     if (opts.mini) return D;
 
