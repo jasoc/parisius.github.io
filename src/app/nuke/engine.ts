@@ -134,6 +134,18 @@ function makeUfoTex() {
   }
   return c;
 }
+/** a chunk of building: irregular dark polygon, lighter broken edge (debris billboards) */
+function makeChunkTex() {
+  const c = document.createElement('canvas'); c.width = c.height = 64;
+  const g = c.getContext('2d');
+  let seed = 7; const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+  g.beginPath();
+  for (let i = 0; i < 9; i++) { const a = (i / 9) * Math.PI * 2 + rnd() * 0.4, r = 18 + rnd() * 12; g[i ? 'lineTo' : 'moveTo'](32 + r * Math.cos(a), 32 + r * Math.sin(a)); }
+  g.closePath();
+  const gr = g.createLinearGradient(10, 10, 54, 54); gr.addColorStop(0, '#8d8378'); gr.addColorStop(1, '#3b3530');
+  g.fillStyle = gr; g.fill(); g.strokeStyle = 'rgba(25,22,20,.9)'; g.lineWidth = 2.5; g.stroke();
+  return c;
+}
 function makePersonTex() {
   const c = document.createElement('canvas'); c.width = 16; c.height = 32;
   const g = c.getContext('2d');
@@ -341,7 +353,8 @@ export class NukeEngine {
   private drag = null;
   private tileset = null; private labGlobe = null; private labTiles = null;
   private puffTex = makePuffTex(); private glowTex = makeGlowTex(); private jetTex = makeJetTex(); private turretTex = makeTurretTex();
-  private ufoTex = makeUfoTex(); private personTex = makePersonTex();
+  private ufoTex = makeUfoTex(); private personTex = makePersonTex(); private chunkTex = makeChunkTex();
+  private chunks = [];
   private actx = null; private master = null; private noiseBuf = null; private lastSmallSound = 0;
   private geocoder;
 
@@ -370,7 +383,7 @@ export class NukeEngine {
     this.puffs = scene.primitives.add(new Cesium.BillboardCollection({ blendOption: Cesium.BlendOption.TRANSLUCENT }));
     // one collection per texture: mixing differently sized canvases in one atlas breaks it (WebGL copy errors)
     const col = () => scene.primitives.add(new Cesium.BillboardCollection({ blendOption: Cesium.BlendOption.TRANSLUCENT }));
-    this.cols = { puff: col(), glow: col(), jet: col(), misc: col(), ufo: col(), person: col() };
+    this.cols = { puff: col(), glow: col(), jet: col(), misc: col(), ufo: col(), person: col(), chunk: col() };
     this.setupControls();
     this.loadGoogle();
 
@@ -394,7 +407,7 @@ export class NukeEngine {
   }
 
   private needsFrames() {
-    return this.blasts.some((D) => D.t < D.E.Trise * 3 || !D.heard) || this.flyers.length > 0 || this.particles.length > 0 ||
+    return this.blasts.some((D) => D.t < D.E.Trise * 3 || !D.heard) || this.flyers.length > 0 || this.particles.length > 0 || this.chunks.length > 0 ||
       this.bombs.length > 0 || this.planes.length > 0 || this.turrets.length > 0 || this.ufos.length > 0 || this.ducks.some((d) => !d.rest) ||
       this.shake.amp > 0 || this.keys.size > 0 || this.recentering || this.zoomPending !== 0 || this.FLASH > 0.001 ||
       this.jobs.length > 0 || this.atlasDirty || this.mapDirty || this.blasts.some((D) => D.heat > 0) || (this.armed && this.hoverRest && !this.hoverRest.done);
@@ -638,7 +651,10 @@ export class NukeEngine {
         // where the terrain is unreliable (residuals spread wide: ±25 m in Genoa) lift the estimate, so hillsides
         // it gets wrong are not flattened as if they were buildings; only the upper floors fall there
         const iqr = res.length >= 4 ? res[Math.floor(res.length * 0.75)] - res[Math.floor(res.length * 0.25)] : 0;
-        return { off: res[res.length >> 1], margin: Math.min(12, 0.75 * iqr), res };
+        const off = res[res.length >> 1], ok = got.filter(Boolean);
+        // share of samples standing > 6 m above the ground estimate: how built-up the place is (debris rate)
+        const urban = ok.length ? ok.filter((q) => q.h - at(dtm, q.x, q.y) - off > 6).length / ok.length : 0.3;
+        return { off, margin: Math.min(12, 0.75 * iqr), res, urban };
       });
     }
     Promise.all([Q.dtmP, Q.calP]).then(async ([dtm, cal]) => {
@@ -647,7 +663,7 @@ export class NukeEngine {
       if (dtm) {
         const c = cal || { off: 0, margin: 8 };
         for (let k = 0; k < N * N; k++) hm[k] = dtm[k] + c.off + c.margin;
-        Q.src = cal ? 'terrain' : 'terrain-uncal'; Q.res = c.res; Q.margin = c.margin;
+        Q.src = cal ? 'terrain' : 'terrain-uncal'; Q.res = c.res; Q.margin = c.margin; Q.urban = c.urban ?? 0.3;
       } else {
         // no terrain: lower envelope of a 7x7 net of Google samples, else flat
         const net = []; for (let j = 0; j < 7; j++) for (let i = 0; i < 7; i++) net.push([S * 0.85 * (i / 3 - 1), S * 0.85 * (j / 3 - 1)]);
@@ -680,7 +696,7 @@ export class NukeEngine {
   private applyPrep(D, Q) {
     const h0 = Cesium.Cartographic.fromCartesian(D.origin).height, dz = Q.h0 - h0;
     D.hm = dz ? Q.hm.map((v) => v + dz) : Q.hm; D.h0 = h0; D.hmS = Q.S;
-    D.hmSrc = Q.src; D.hmRes = Q.res; D.hmMargin = Q.margin;
+    D.hmSrc = Q.src; D.hmRes = Q.res; D.hmMargin = Q.margin; D.urban = Q.urban ?? 0.3;
     this.padGen++; // padOf changes once a heightmap exists (leaning blocks)
     this.writeAtlas(D);
   }
@@ -1165,6 +1181,7 @@ export class NukeEngine {
     this.mStress.fill(0); this.mScorch.fill(0); this.mCrater.fill(0); this.mBytes.fill(0); this.maxStress = 0; this.mapDirty = true;
     this.flyers.forEach((f) => { this.rm(f.head); f.entity && this.viewer.entities.remove(f.entity); }); this.flyers = [];
     this.particles.forEach((p) => this.rm(p.b)); this.particles = [];
+    this.chunks.forEach((c) => this.rm(c.b)); this.chunks = [];
     this.ducks.forEach((d) => { d.model && this.scene.primitives.remove(d.model); d.bb && this.rm(d.bb); }); this.ducks = [];
     this.turrets.forEach((t) => this.removeTurret(t)); this.turrets = [];
     this.planes.forEach((P) => { this.removeShape(P.shape); this.rm(P.strobe); }); this.planes = [];
@@ -1617,6 +1634,7 @@ export class NukeEngine {
     // collapse follows the front, but needs the bare-earth heightmap: if that lands late, it catches up in ~1.5 s
     if (D.hm) D.cshock = Math.min(D.shock, D.cshock + Math.max(D.shock - shock0, (E.r5 / 1.5) * dt));
     D.dtSim = dtSim;
+    this.spawnChunks(D);
     const glow = Math.exp(-t / E.tglow), night = 1 - (D.tn ? D.tn.day : 1);
     D.flash = t < 0.04 ? 1 : 0.95 * Math.exp(-(t - 0.04) / (0.12 + 0.35 * E.tmax));
     D.warm = 0.6 * glow * (1 + night);
@@ -1670,6 +1688,58 @@ export class NukeEngine {
       p.b.color = new Cesium.Color(lerp(p.c0[0], p.c1[0] * dk[0], cf), lerp(p.c0[1], p.c1[1] * dk[1], cf), lerp(p.c0[2], p.c1[2] * dk[2], cf), p.a0 * (1 - f) * Math.min(1, p.age * 8));
     }
   }
+  // ---- debris: fake ballistic chunks (no physics engine): gravity, spin, one bounce, rest, fade ----
+  /** chunks thrown outward and up from the band the collapse front just crossed, near the camera only */
+  private spawnChunks(D) {
+    if (!this.tileset || !D.hm || D.retired) return;
+    const E = D.E, C3 = Cesium.Cartesian3, r0 = Math.max(D.chunkR || 0, 0.3 * E.Rfb), r1 = Math.min(D.cshock, E.r5);
+    if (r1 <= r0) return;
+    D.chunkR = r1;
+    const cam = this.camera.positionWC, dc = C3.distance(cam, D.groundPos);
+    if (dc > 3 * E.r5 + 2000 || this.chunks.length >= 600) return;
+    // rate: built-up share of the place x annulus area, capped per frame and globally (≤ 600 live)
+    const area = Math.PI * (r1 * r1 - r0 * r0) / 1e6, k = this.cv.clientHeight / (2 * Math.tan((this.camera.frustum.fovy || 1) / 2));
+    let n = Math.min(40, 600 - this.chunks.length, Math.round(area * 60 * (D.urban ?? 0.3) + Math.random()));
+    if (!D.enuO) D.enuO = Cesium.Transforms.eastNorthUpToFixedFrame(D.origin);
+    for (; n > 0; n--) {
+      const a = Math.random() * 6.2832, r = Math.sqrt(r0 * r0 + Math.random() * (r1 * r1 - r0 * r0));
+      const x = r * Math.cos(a), y = r * Math.sin(a), size = 3 + 12 * Math.random() ** 2;
+      const pos = Cesium.Matrix4.multiplyByPoint(D.enuO, new C3(x, y, this.hmAt(D, x, y) + 6 + Math.random() * 25), new C3());
+      if ((size / Math.max(C3.distance(cam, pos), 1)) * k < 1) continue; // under a pixel: not worth a billboard
+      const s = 1 - 0.6 * smooth(E.r20, E.r5, r), out = (30 + 80 * Math.random()) * s, upv = 15 + 40 * Math.random();
+      const vel = Cesium.Matrix4.multiplyByPointAsVector(D.enuO, new C3(out * Math.cos(a), out * Math.sin(a), upv), new C3());
+      const b = this.bb(null, 'chunk', { sizeInMeters: true, position: pos, width: size, height: size * (0.6 + 0.5 * Math.random()), rotation: Math.random() * 6.28 });
+      this.chunks.push({ b, pos, vel, D, size, spin: (Math.random() - 0.5) * 8, bounced: false, rest: 0 });
+    }
+  }
+  private updateChunks(dt) {
+    if (!this.chunks.length) return;
+    const C3 = Cesium.Cartesian3, tn = this.tint, l = new C3(), g = new C3();
+    for (let i = this.chunks.length - 1; i >= 0; i--) {
+      const c = this.chunks[i], D = c.D;
+      if (c.rest > 0) {
+        c.rest += dt; const a = 1 - smooth(4, 10, c.rest);
+        if (a <= 0) { this.rm(c.b); this.chunks.splice(i, 1); continue; }
+        c.b.color = new Cesium.Color(tn[0], tn[1], tn[2], a);
+        continue;
+      }
+      C3.add(c.vel, C3.multiplyByScalar(D.up, -9.81 * dt, g), c.vel);
+      C3.add(c.pos, C3.multiplyByScalar(c.vel, dt, g), c.pos);
+      c.b.position = c.pos; c.b.rotation += c.spin * dt;
+      // the ground: this blast's bare-earth estimate plus every crater / subsidence (CPU mirror, no sampleHeight)
+      Cesium.Matrix4.multiplyByPoint(D.invEnu, c.pos, l);
+      const ground = (D.hm ? this.hmAt(D, l.x, l.y) : 0) + this.deformAt(c.pos) + c.size * 0.3;
+      if (l.z > ground) continue;
+      const up = C3.dot(c.vel, D.up);
+      if (!c.bounced) { // one bounce: lose most of the speed, kick a little dust
+        c.bounced = true;
+        C3.add(C3.multiplyByScalar(c.vel, 0.35, c.vel), C3.multiplyByScalar(D.up, -up * 0.35 * 1.6, g), c.vel);
+        c.spin *= 0.5;
+        if (Math.random() < 0.35) this.spawn(C3.clone(c.pos), { s0: c.size * 1.2, s1: c.size * 5, life: 2.2, c0: [0.62, 0.57, 0.5], c1: [0.55, 0.5, 0.45], a0: 0.35 });
+      } else { c.rest = 0.001; c.vel = new C3(); }
+    }
+  }
+
   private launchFlyer(o) {
     const head = this.bb(null, o.image || 'glow', { sizeInMeters: !o.headPixels, position: o.path(0), width: o.headPixels || o.headSize, height: o.headPixels || o.headSize, color: o.headColor, alignedAxis: Cesium.Cartesian3.ZERO });
     const f = { ...o, t: 0, head, acc: 0, size: o.headPixels || o.headSize };
@@ -2166,7 +2236,7 @@ export class NukeEngine {
   /** Billboard with a shared texture: a canvas passed as `image` would be copied into the atlas once per billboard. */
   private bb(col, id, opts) {
     const b = (col || this.cols[id]).add(opts);
-    b.setImage(id, { puff: this.puffTex, glow: this.glowTex, jet: this.jetTex, ufo: this.ufoTex, person: this.personTex }[id]);
+    b.setImage(id, { puff: this.puffTex, glow: this.glowTex, jet: this.jetTex, ufo: this.ufoTex, person: this.personTex, chunk: this.chunkTex }[id]);
     return b;
   }
   private rm(b) { b._billboardCollection?.remove(b); }
@@ -2221,7 +2291,7 @@ export class NukeEngine {
     if (Math.abs(hd - this.lastHeading) > 0.5) { this.lastHeading = hd; this.ev.heading(hd); }
     this.noDepth(this.puffs); Object.values(this.cols).forEach((c) => this.noDepth(c));
 
-    this.updateFlyers(dt); this.updateBombs(dt); this.updateParticles(dt); this.updateDucks(dt); this.updateTurrets(dt); this.updateUfos(dt); this.updatePlanes(dt);
+    this.updateFlyers(dt); this.updateBombs(dt); this.updateParticles(dt); this.updateChunks(dt); this.updateDucks(dt); this.updateTurrets(dt); this.updateUfos(dt); this.updatePlanes(dt);
     if (this.hoverPx && this.armed) { const h = this.pickWorld(this.hoverPx); if (h) this.hover = h; this.hoverPx = null; }
     // the cursor rests on a target: start its bare-earth heightmap now, the click will likely land there
     if (this.armed && this.hover && this.tileset && !this.launchMode && !this.lineStart) {

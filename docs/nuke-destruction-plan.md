@@ -90,6 +90,19 @@ Not checked: a hilly city or coast (Milan only), a moving-camera visual check fo
   altitude), so the margin hit its 12 m cap.
 - Not done: the optional camera-following regional map; the antimeridian splat wraps but was not tested.
 
+## Phase 5 notes (debris)
+
+- Chunks spawn in the band the collapse front just crossed, at a rate set by the blast's "urban" share (fraction
+  of its calibration samples standing > 6 m above the ground estimate). The plan's per-point
+  `sampleHeight - ground > 6 m` test was not used: `sampleHeight` costs 10-30 ms a call.
+- Ballistics on the CPU mirror (heightmap + deformAt), not `surfaceHeight`, for the same reason. One bounce
+  (35 % of them kick a dust puff), rest, fade 4-10 s. Spawned only within 3·r5 of the camera and ≥ 1 px;
+  ≤ 600 live, ≤ 40 per frame.
+- Verified: Little Boy over Milan, camera 1.5 km out: 254 chunks at peak, all bounced, rested and faded by ~18 s.
+- `window.__nuke` is now exposed only in dev builds with `?debug` (stripped from production via `ngDevMode`).
+- Regression pass (Chrome): chain reaction (10 blasts), ring toggle, thumbnails, labels on tiles, `clear()` wipes
+  blasts / chunks / slots / preps / stress map. Globe fallback decal checked in Phase 1.
+
 Goal: when a bomb goes off, the world is physically changed. Real craters, buildings that collapse as
 the shock front passes, ground cracks, flying debris, and cumulative damage that lets Tsar-spam sink
 and crack a whole continent. Everything persists until `clear()`.

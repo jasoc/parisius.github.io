@@ -8,6 +8,8 @@ import { MatSliderModule } from '@angular/material/slider';
 import { MatSnackBar, MatSnackBarModule } from '@angular/material/snack-bar';
 import { MatTooltipModule } from '@angular/material/tooltip';
 import { loadCesium } from './cesium-loader';
+
+declare const ngDevMode: unknown;
 import { NukeEngine, SavedView, effects } from './engine';
 import { TOOLS, TOOL_GROUPS, Tool, fmtW } from './tools';
 
@@ -102,7 +104,9 @@ export class Nuke {
           heading: (d) => this.heading.set(d),
           abducted: (n) => this.abducted.set(n),
         });
-        (window as any).__nuke = this.engine; // handy from the devtools console
+        // dev builds with ?debug: script detonations and camera moves from the devtools console
+        // (ngDevMode is constant-folded to false by production builds, so this is stripped from them)
+        if (typeof ngDevMode !== 'undefined' && ngDevMode && new URLSearchParams(location.search).has('debug')) (window as any).__nuke = this.engine;
         this.applyOpts(this.opts(), []);
         this.engine.setSunHour(this.sunHour());
         this.engine.setArmed(false);
