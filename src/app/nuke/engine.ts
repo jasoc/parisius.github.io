@@ -244,15 +244,17 @@ const GLSL_COMMON = `
     return 5000.0 * smoothstep(6.0, 8.0, st) * mix(0.3, 1.8, ridge);
   }
   // distance (cell units) to the nearest Voronoi cell border (F2-F1 style, exact border distance)
+  // (loop bounds come from a uniform so the compiler cannot unroll 4 calls x 34 iterations into the shader)
   float vorEdge(vec2 x) {
     vec2 n = floor(x), f = fract(x), mr = vec2(0.0), mg = vec2(0.0);
     float md = 8.0;
-    for (int j = -1; j <= 1; j++) for (int i = -1; i <= 1; i++) {
+    int k1 = int(u_one), k2 = 2 * k1;
+    for (int j = -k1; j <= k1; j++) for (int i = -k1; i <= k1; i++) {
       vec2 g = vec2(float(i), float(j)), r = g + vec2(h21(n + g), h21(n + g + 19.19)) - f;
       float d = dot(r, r); if (d < md) { md = d; mr = r; mg = g; }
     }
     md = 8.0;
-    for (int j = -2; j <= 2; j++) for (int i = -2; i <= 2; i++) {
+    for (int j = -k2; j <= k2; j++) for (int i = -k2; i <= k2; i++) {
       vec2 g = mg + vec2(float(i), float(j)), r = g + vec2(h21(n + g), h21(n + g + 19.19)) - f;
       if (dot(mr - r, mr - r) > 1e-5) md = min(md, dot(0.5 * (mr + r), normalize(r - mr)));
     }
@@ -548,6 +550,7 @@ export class NukeEngine {
       q[o + 2] = this.mCrater[k] > 0 ? Math.min(255, Math.round((Math.log2(1 + this.mCrater[k]) / Math.log2(60001)) * 255)) : 0; q[o + 3] = 255;
     }
     this.mapDirty = true; this.padGen++;
+    this.bShader.setUniform('u_mapOn', 1);
   }
   private stressAt(carto) {
     const MW = this.MW, MH = this.MH, x = (carto.longitude / (2 * Math.PI) + 0.5) * MW - 0.5, y = (carto.latitude / Math.PI + 0.5) * MH - 0.5;
@@ -736,7 +739,15 @@ export class NukeEngine {
   private MAX = 16;
   private setupShader() {
     const U = Cesium.UniformType, uniforms = {};
-    let calls = '', vcalls = '', ccalls = '';
+    // ONE loop over the slots, not 16 copies of the body: the unrolled shader was 75 KB and took 2.5 s to compile
+    // on every new tile variant (labels on/off...), far worse with Direct3D on Windows. Uniforms cannot be
+    // indexed, so small getters pick slot i's.
+    let get = '';
+    for (const [fn, ty, u] of [['sM', 'mat4', 'u_m'], ['sA', 'vec4', 'u_a'], ['sB', 'vec4', 'u_b'], ['sD', 'vec4', 'u_d'], ['sE', 'vec4', 'u_e']]) {
+      get += `${ty} ${fn}(int i) {`;
+      for (let i = 0; i < this.MAX - 1; i++) get += ` if (i == ${i}) return ${u}${i};`;
+      get += ` return ${u}${this.MAX - 1}; }\n`;
+    }
     for (let i = 0; i < this.MAX; i++) {
       // u_m = inverse(blast ENU) * inverse(view), built in doubles every frame: eye coords -> blast-local metres,
       // precise near the blast (float32 world coords are only good to ~0.5 m)
@@ -745,17 +756,17 @@ export class NukeEngine {
       uniforms['u_b' + i] = { type: U.VEC4, value: new Cesium.Cartesian4(0, 0, 0, 1) }; // rth, burn, glowB, glow radius
       uniforms['u_d' + i] = { type: U.VEC4, value: new Cesium.Cartesian4() }; // crater radius, crater progress, heat, seed
       uniforms['u_e' + i] = { type: U.VEC4, value: new Cesium.Cartesian4() }; // atlas idx, atlas half-extent, collapse, hob
-      calls += `fx(pEC, u_m${i}, u_a${i}, u_b${i}, u_d${i}, u_e${i}, tint, material, ck, ck2, ckXY, ckUp);\n`;
-      vcalls += `dEC += vfx(pEC, u_m${i}, u_a${i}, u_b${i}, u_d${i}, u_e${i});\n`;
-      ccalls += `cfx(pEC, u_m${i}, u_a${i}, u_b${i}, u_d${i}, u_e${i}, best, bestEC, bestXY);\n`;
     }
+    uniforms.u_n = { type: U.FLOAT, value: 0 };
+    uniforms.u_one = { type: U.FLOAT, value: 1 }; // always 1: a loop bound the compiler cannot see through     // slots in use (highest index + 1)
+    uniforms.u_mapOn = { type: U.FLOAT, value: 0 }; // anything in the global damage map at all
     uniforms.u_hm = { type: U.SAMPLER_2D, value: this.atlasUniform() };
     uniforms.u_map = { type: U.SAMPLER_2D, value: this.mapUniform() };
     uniforms.u_rings = { type: U.FLOAT, value: this.showRings ? 1 : 0 };
     this.bShader = new Cesium.CustomShader({
       uniforms,
       varyings: { v_col: Cesium.VaryingType.VEC4, v_rxy: Cesium.VaryingType.VEC2 },
-      vertexShaderText: GLSL_COMMON + GLSL_COLLAPSE + `
+      vertexShaderText: get + GLSL_COMMON + GLSL_COLLAPSE + `
       // displacement of one blast, in eye coordinates (summed over blasts, then taken back to model space)
       vec3 vfx(vec3 pEC, mat4 M, vec4 a, vec4 b, vec4 dd, vec4 e) {
         if (a.y <= 0.0 || dd.y <= 0.0) return vec3(0.0);
@@ -766,19 +777,26 @@ export class NukeEngine {
       void vertexMain(VertexInput vsInput, inout czm_modelVertexOutput vsOutput) {
         vec3 pEC = (czm_modelView * vec4(vsOutput.positionMC, 1.0)).xyz;
         vec3 dEC = vec3(0.0);
-        ${vcalls}
+        vec4 best = vec4(0.0); vec3 bestEC = vec3(0.0); vec2 bestXY = vec2(0.0);
+        int n = int(u_n);
+        for (int i = 0; i < n; i++) {
+          mat4 M = sM(i); vec4 a = sA(i), b = sB(i), dd = sD(i), e = sE(i);
+          dEC += vfx(pEC, M, a, b, dd, e);
+          cfx(pEC, M, a, b, dd, e, best, bestEC, bestXY);
+        }
         // overlapping craters add up; never deeper than ~60 km
-        vec2 ll = lonLat(pEC);
-        float sub = subsidence(dmgAt(ll).g * 255.0 / 32.0, globeXY(ll));
-        dEC -= normalize(pEC - czm_view[3].xyz) * sub; // czm_view[3]: the Earth's centre in eye coordinates
+        float sub = 0.0;
+        if (u_mapOn > 0.0) {
+          vec2 ll = lonLat(pEC);
+          sub = subsidence(dmgAt(ll).g * 255.0 / 32.0, globeXY(ll));
+          dEC -= normalize(pEC - czm_view[3].xyz) * sub; // czm_view[3]: the Earth's centre in eye coordinates
+        }
         float L = length(dEC);
         if (L > 60000.0) dEC *= 60000.0 / L;
-        vec4 best = vec4(0.0); vec3 bestEC = vec3(0.0); vec2 bestXY = vec2(0.0);
-        ${ccalls}
         v_col = vec4(best.xyz, sub); v_rxy = bestXY;
         vsOutput.positionMC += mat3(czm_inverseModelView) * (dEC + bestEC);
       }`,
-      fragmentShaderText: GLSL_COMMON + `
+      fragmentShaderText: get + GLSL_COMMON + `
       void fx(vec3 pEC, mat4 M, vec4 a, vec4 b, vec4 dd, vec4 e, vec3 tint, inout czm_modelMaterial m,
               inout vec4 ck, inout vec4 ck2, inout vec2 ckXY, inout vec3 ckUp) {
         if (a.y <= 0.0) return;
@@ -852,7 +870,8 @@ export class NukeEngine {
         float px = max(max(length(dpx), length(dpy)), 1e-3);
         vec3 nEC = normalize(cross(dpx, dpy));
         vec4 ck = vec4(0.0), ck2 = vec4(0.0); vec2 ckXY = vec2(0.0); vec3 ckUp = vec3(0.0, 0.0, 1.0);
-        ${calls}
+        int n = int(u_n);
+        for (int i = 0; i < n; i++) fx(pEC, sM(i), sA(i), sB(i), sD(i), sE(i), tint, material, ck, ck2, ckXY, ckUp);
         // collapsed buildings: the stretched photo turns into rubble (burnt in the fire zone); soot on standing walls
         float col = v_col.x, abv = v_col.y, fire = v_col.z;
         if (col > 0.02) {
@@ -862,7 +881,8 @@ export class NukeEngine {
         }
         material.diffuse *= 1.0 - 0.45 * fire * smoothstep(3.0, 10.0, abv) * (1.0 - smoothstep(0.1, 0.4, col));
         // the global damage map: old scars no slot draws (weighted by 1 - slot coverage), and cumulative stress
-        vec2 ll = lonLat(pEC); vec4 dm = dmgAt(ll); vec2 gxy = globeXY(ll);
+        vec2 ll = vec2(0.0), gxy = vec2(0.0); vec4 dm = vec4(0.0);
+        if (u_mapOn > 0.0) { ll = lonLat(pEC); dm = dmgAt(ll); gxy = globeXY(ll); }
         float far = 1.0 - ck2.z;
         vec3 upEC = normalize(pEC - czm_view[3].xyz);
         float lvl = smoothstep(0.55, 0.85, abs(dot(nEC, upEC)));
@@ -1195,10 +1215,11 @@ export class NukeEngine {
 
   clear() {
     [...this.blasts].forEach((D) => this.removeBlast(D));
-    this.slots.fill(null);
+    this.slots.fill(null); this.slotsN = 0; this.bShader.setUniform('u_n', 0);
     this.jobs = []; this.atlas.fill(0); this.atlasDirty = true;
     this.preps.forEach((q) => (q.dead = true)); this.preps = [];
     this.mStress.fill(0); this.mScorch.fill(0); this.mCrater.fill(0); this.mBytes.fill(0); this.maxStress = 0; this.mapDirty = true;
+    this.bShader.setUniform('u_mapOn', 0);
     this.flyers.forEach((f) => { this.rm(f.head); f.entity && this.viewer.entities.remove(f.entity); }); this.flyers = [];
     this.particles.forEach((p) => this.rm(p.b)); this.particles = [];
     this.chunks.forEach((c) => this.rm(c.b)); this.chunks = [];
@@ -1428,7 +1449,10 @@ export class NukeEngine {
       this.writeAtlas(D);
     }
     for (let i = 0; i < N; i++) this.setSlot(i, this.slots[i]);
+    let top = 0; for (let i = 0; i < N; i++) if (this.slots[i]) top = i + 1;
+    if (top !== this.slotsN) { this.slotsN = top; this.bShader.setUniform('u_n', top); }
   }
+  private slotsN = -1;
   private removeBlast(D) {
     D.dead = true;
     if (D.ground) this.scene.primitives.remove(D.ground);
