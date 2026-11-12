@@ -957,6 +957,30 @@ export class NukeEngine {
     if (!Cesium.defined(p)) p = this.camera.pickEllipsoid(pos);
     return p;
   }
+  /**
+   * The ground point under the cursor for navigation pivots. pickPosition reads the depth buffer: when the pixel
+   * is sky, a tile still loading, or the depth is stale, it misses or lands somewhere else (then the pivot fell
+   * onto the ellipsoid, under the real ground). Validate it against the cursor ray; else cast the ray into the
+   * tiles; else the ellipsoid.
+   */
+  navPick(pos) {
+    const scene = this.scene, C3 = Cesium.Cartesian3, ray = this.camera.getPickRay(pos);
+    if (!ray) return undefined;
+    const onRay = (p) => {
+      if (!p) return false;
+      const v = C3.subtract(p, ray.origin, new C3()), t = C3.dot(v, ray.direction);
+      if (t <= 0) return false;
+      const off = C3.distance(p, C3.add(ray.origin, C3.multiplyByScalar(ray.direction, t, new C3()), new C3()));
+      return off < Math.max(3, 0.01 * t);
+    };
+    let p = scene.pickPositionSupported ? scene.pickPosition(pos) : undefined;
+    if (onRay(p)) return p;
+    if (this.tileset) {
+      const restore = this.hideForSampling();
+      try { const r = scene.pickFromRay(ray, this.viewer.entities.values); if (r && onRay(r.position)) return r.position; } catch {} finally { restore(); }
+    }
+    return this.camera.pickEllipsoid(pos) || p;
+  }
   private centerPoint() { return this.pickWorld(new Cesium.Cartesian2(this.cv.clientWidth / 2, this.cv.clientHeight / 2)); }
 
   private setupControls() {
@@ -982,16 +1006,17 @@ export class NukeEngine {
       e.preventDefault();
       const r = cv.getBoundingClientRect(), pos = new Cesium.Cartesian2(e.clientX - r.left, e.clientY - r.top);
       const dy = e.deltaMode === 1 ? e.deltaY * 40 : e.deltaY;
-      let P = this.pickWorld(pos) || camera.pickEllipsoid(new Cesium.Cartesian2(cv.clientWidth / 2, cv.clientHeight / 2));
+      let P = this.navPick(pos) || camera.pickEllipsoid(new Cesium.Cartesian2(cv.clientWidth / 2, cv.clientHeight / 2));
       if (!P) { // looking at space: zoom toward the point of the Earth right below the camera
         const c = Cesium.Cartographic.fromCartesian(camera.positionWC); c.height = 0;
         P = Cesium.Cartographic.toCartesian(c);
       }
       this.zoomTarget = P;
-      this.zoomPending = Cesium.Math.clamp((this.zoomPending || 0) + dy * 0.0016, -3, 3);
+      // capped low and drained fast: a hard flick must not keep the zoom rolling after the wheel stops
+      this.zoomPending = Cesium.Math.clamp((this.zoomPending || 0) + dy * 0.0016, -1.2, 1.2);
       if (dy > 0) {
         if (performance.now() > this.zoomOutUntil) this.recenterHeading = camera.heading;
-        this.zoomOutUntil = performance.now() + 900;
+        this.zoomOutUntil = performance.now() + 300;
       }
       this.poke();
     }, { passive: false });
@@ -1006,16 +1031,18 @@ export class NukeEngine {
     on(cv, 'pointerdown', (e) => {
       const mode = e.button === 1 || (e.button === 0 && e.shiftKey) ? 'tilt' : e.button === 2 ? 'zoom' : null;
       if (!mode) return;
-      const P = this.pickWorld(evPos(e)); if (!P) return;
+      const P = this.navPick(evPos(e)); if (!P) return;
       const d: any = { mode, P, up: Cesium.Ellipsoid.WGS84.geodeticSurfaceNormal(P, new C3()), last: evPos(e), start: evPos(e) };
+      this.zoomPending = 0; // a pending wheel zoom would drag the pivot away
       if (mode === 'tilt') {
-        // freeze the orbit at drag start: everything below is computed from these, never accumulated
-        d.enu = Cesium.Transforms.eastNorthUpToFixedFrame(P);
-        const v = Cesium.Matrix4.multiplyByPoint(Cesium.Matrix4.inverseTransformation(d.enu, new Cesium.Matrix4()), camera.positionWC, new C3());
-        d.R = C3.magnitude(v);
-        d.el0 = Math.asin(Cesium.Math.clamp(v.z / d.R, -1, 1));
-        d.az0 = Math.hypot(v.x, v.y) > 1 ? Math.atan2(v.x, v.y) : camera.heading + Math.PI; // compass bearing P -> camera
-        d.h0 = camera.heading;
+        // freeze the orbit at drag start: every move is ONE rigid rotation of the start pose about P, so P cannot
+        // leave the cursor (rebuilding heading/pitch in the camera's own frame let it slide, far out or at limits)
+        d.pos0 = C3.clone(camera.positionWC); d.dir0 = C3.clone(camera.directionWC); d.up0 = C3.clone(camera.upWC);
+        d.v0 = C3.subtract(d.pos0, P, new C3());
+        const R = C3.magnitude(d.v0);
+        d.el0 = Math.asin(Cesium.Math.clamp(C3.dot(d.v0, d.up) / R, -1, 1));
+        const ax = C3.cross(d.up, d.v0, new C3());
+        d.axis = C3.magnitude(ax) > 1e-6 * R ? C3.normalize(ax, ax) : C3.negate(camera.rightWC, new C3()); // horizontal, ⟂ to P->camera
         d.p0 = camera.pitch;
         d.h0alt = Cesium.Cartographic.fromCartesian(camera.positionWC).height;
       }
@@ -1042,17 +1069,32 @@ export class NukeEngine {
       // tilt range shrinks with altitude: from far away you cannot tilt the globe off screen
       const pMax = this.maxPitch(d.h0alt);
       const lo = Math.max(Cesium.Math.toRadians(3), d.el0 - Math.max(0, pMax - d.p0)), hi = Cesium.Math.toRadians(89.5);
-      const el = Cesium.Math.clamp(d.el0 + ty * (Math.PI / cv.clientHeight), Math.min(lo, d.el0), hi);
-      const az = d.az0 + tx * ((2 * Math.PI) / cv.clientWidth);
-      const pos = Cesium.Matrix4.multiplyByPoint(d.enu, new C3(d.R * Math.cos(el) * Math.sin(az), d.R * Math.cos(el) * Math.cos(az), d.R * Math.sin(el)), new C3());
-      camera.setView({
-        destination: pos,
-        orientation: {
-          heading: d.h0 + (az - d.az0),
-          pitch: Cesium.Math.clamp(d.p0 - (el - d.el0), Cesium.Math.toRadians(-89.5), Math.max(pMax, d.p0)),
-          roll: 0,
-        },
-      });
+      const el = Cesium.Math.clamp(d.el0 + ty * (Math.PI / cv.clientHeight), Math.min(lo, d.el0), Math.max(hi, d.el0));
+      const az = tx * ((2 * Math.PI) / cv.clientWidth);
+      // elevation: about the horizontal axis through P; bearing: about P's vertical. Same rotation for position,
+      // direction and up: rigid, so the grabbed point stays exactly under the cursor
+      const q = Cesium.Quaternion.multiply(Cesium.Quaternion.fromAxisAngle(d.up, -az), Cesium.Quaternion.fromAxisAngle(d.axis, d.el0 - el), new Cesium.Quaternion());
+      const Rm = Cesium.Matrix3.fromQuaternion(q), rot = (v) => Cesium.Matrix3.multiplyByVector(Rm, v, new C3());
+      const pos = C3.add(d.P, rot(d.v0), new C3()), dir = rot(d.dir0), up = rot(d.up0);
+      // grabbed off-centre, that rotation also rolls the view. Turning the camera about its own ray to P leaves P on
+      // the same pixel, so pick the turn that makes the camera's right vector horizontal again (roll 0)
+      const u = C3.normalize(C3.subtract(d.P, pos, new C3()), new C3()), n = Cesium.Ellipsoid.WGS84.geodeticSurfaceNormal(pos, new C3());
+      const r = C3.cross(dir, up, new C3()), ur = C3.cross(u, r, new C3());
+      const A = C3.dot(r, n), B = C3.dot(ur, n), Cc = C3.dot(u, r) * C3.dot(u, n), K = A - Cc, R0 = Math.hypot(K, B);
+      if (R0 > 1e-9 && Math.abs(Cc / R0) <= 1) {
+        const phi = Math.atan2(B, K), w = Math.acos(-Cc / R0);
+        const turn = (th) => Cesium.Matrix3.fromQuaternion(Cesium.Quaternion.fromAxisAngle(u, th));
+        let best = null;
+        for (const th of [phi + w, phi - w]) {
+          const t = Cesium.Math.negativePiToPi(th), M = turn(t), up2 = Cesium.Matrix3.multiplyByVector(M, up, new C3());
+          if (C3.dot(up2, n) > 0 && (!best || Math.abs(t) < Math.abs(best.t))) best = { t, M, up2 };
+        }
+        if (best && Math.abs(best.t) < 1.2) { Cesium.Matrix3.multiplyByVector(best.M, dir, dir); C3.clone(best.up2, up); }
+      }
+      // write the vectors directly: setView converts them to heading/pitch/roll, which is degenerate looking
+      // straight down (gimbal lock) and let P slip ~70 px from orbit
+      camera.lookAtTransform(Cesium.Matrix4.IDENTITY);
+      C3.clone(pos, camera.position); C3.clone(dir, camera.direction); C3.clone(up, camera.up); C3.cross(dir, up, camera.right);
     });
     on(cv, 'pointerup', () => (this.drag = null));
     on(cv, 'pointercancel', () => (this.drag = null));
@@ -1105,7 +1147,7 @@ export class NukeEngine {
   private applyZoom(dt) {
     if (!this.zoomPending || !this.zoomTarget) return;
     const C3 = Cesium.Cartesian3, cam = this.camera;
-    const step = this.zoomPending * Math.min(1, dt * 14);
+    const step = this.zoomPending * Math.min(1, dt * 20);
     this.zoomPending -= step;
     if (Math.abs(this.zoomPending) < 0.002) this.zoomPending = 0;
     const P = this.zoomTarget, rel = C3.subtract(cam.positionWC, P, new C3());
