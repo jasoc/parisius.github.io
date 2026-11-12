@@ -2,146 +2,168 @@
 <div class="tp-fade" [class.on]="teleporting()"></div>
 
 @if (loading()) {
-  <div class="loading"><span class="spinner"></span> loading globe…</div>
+  <div class="loading"><mat-spinner diameter="28" /><span>Loading the globe…</span></div>
 }
 
 <!-- ============ armory ============ -->
-<aside class="panel">
-  <header>
-    <span class="brand">nuke<span>.sim</span></span>
-    <span class="prompt">$ armory</span>
-  </header>
+<mat-card class="panel" appearance="raised">
+  <mat-card-header>
+    <div mat-card-avatar class="avatar">☢️</div>
+    <mat-card-title>Nuke Sim</mat-card-title>
+    <mat-card-subtitle>Pick a payload, arm, click the map</mat-card-subtitle>
+  </mat-card-header>
 
-  <label class="search">
-    <mat-icon>search</mat-icon>
-    <input #q type="text" placeholder="Cerca un luogo e premi Invio" autocomplete="off" spellcheck="false" (keydown.enter)="search(q)" />
-  </label>
+  <mat-card-content>
+    <mat-form-field appearance="outline" subscriptSizing="dynamic" class="search">
+      <mat-icon matPrefix>search</mat-icon>
+      <input #q matInput placeholder="Search a place" autocomplete="off" spellcheck="false" (keydown.enter)="search(q)" />
+    </mat-form-field>
 
-  <section class="preview">
-    <div class="big">{{ tool().icon }}</div>
-    <div class="ptext">
-      <div class="pname">{{ tool().name }}</div>
-      <div class="pmeta">{{ toolMeta() }}</div>
+    <mat-card appearance="outlined" class="preview">
+      <mat-card-header>
+        <div mat-card-avatar class="big">{{ tool().icon }}</div>
+        <mat-card-title>{{ tool().name }}</mat-card-title>
+        <mat-card-subtitle>{{ toolMeta() }}</mat-card-subtitle>
+      </mat-card-header>
+      <mat-card-content><p>{{ tool().desc }}</p></mat-card-content>
+    </mat-card>
+
+    <div class="tools">
+      @for (g of groups; track g.name) {
+        <div class="group-label">{{ g.name }}</div>
+        <mat-chip-listbox [value]="tool().id" (change)="pick(toolById($event.value))" [hideSingleSelectionIndicator]="true" aria-label="Payloads">
+          @for (t of g.tools; track t.id) {
+            <mat-chip-option [value]="t.id" [matTooltip]="t.desc" matTooltipPosition="right">
+              <span matChipAvatar class="chip-ico">{{ t.icon }}</span>{{ t.name }}
+            </mat-chip-option>
+          }
+        </mat-chip-listbox>
+      }
     </div>
-    <p class="pdesc">{{ tool().desc }}</p>
-  </section>
 
-  <div class="tools">
-    @for (g of groups; track g.name) {
-      <div class="group">{{ g.name }}</div>
-      <div class="grid">
-        @for (t of g.tools; track t.id) {
-          <button type="button" class="tile" [class.sel]="t.id === tool().id" (click)="pick(t)" [matTooltip]="t.desc" matTooltipPosition="right">
-            <span class="ico">{{ t.icon }}</span>
-            <span class="tn">{{ t.name }}</span>
-          </button>
-        }
-      </div>
-    }
-  </div>
+    <div class="row">
+      <button mat-flat-button class="arm" [class.armed]="armed()" (click)="toggleArmed()" matTooltip="Arm / disarm (D)">
+        <mat-icon>{{ armed() ? 'gps_fixed' : 'gps_not_fixed' }}</mat-icon>
+        {{ armed() ? 'ARMED' : 'ARM' }}
+      </button>
+      <button mat-stroked-button class="clear" (click)="clear()" matTooltip="Remove everything"><mat-icon>delete_sweep</mat-icon>Clear</button>
+    </div>
 
-  <button type="button" class="drop" [class.on]="armed()" (click)="toggleArmed()" matTooltip="Modalità sgancio (D)">
-    <mat-icon>my_location</mat-icon>
-    {{ armed() ? 'DROP ATTIVO' : 'DROP' }}
-  </button>
+    <div class="row">
+      <mat-button-toggle-group multiple hideMultipleSelectionIndicator [value]="toggles()" (change)="setToggles($event.value)" aria-label="Options">
+        <mat-button-toggle value="chain" matTooltip="Chain reaction (K)"><mat-icon>link</mat-icon></mat-button-toggle>
+        <mat-button-toggle value="sound" matTooltip="Sound"><mat-icon>{{ sound() ? 'volume_up' : 'volume_off' }}</mat-icon></mat-button-toggle>
+        <mat-button-toggle value="rings" matTooltip="Damage radii"><mat-icon>track_changes</mat-icon></mat-button-toggle>
+        <mat-button-toggle value="labels" matTooltip="Borders & place names (L)"><mat-icon>map</mat-icon></mat-button-toggle>
+      </mat-button-toggle-group>
+    </div>
 
-  <div class="toggles">
-    <button type="button" [class.active]="chain()" (click)="toggleChain()" matTooltip="Reazione a catena (K)"><mat-icon>link</mat-icon><span>Catena</span></button>
-    <button type="button" [class.active]="sound()" (click)="toggleSound()" matTooltip="Audio"><mat-icon>{{ sound() ? 'volume_up' : 'volume_off' }}</mat-icon><span>Audio</span></button>
-    <button type="button" [class.active]="rings()" (click)="toggleRings()" matTooltip="Raggi dei danni"><mat-icon>track_changes</mat-icon><span>Raggi</span></button>
-    <button type="button" [class.active]="labels()" (click)="toggleLabels()" matTooltip="Confini e nomi (L)"><mat-icon>map</mat-icon><span>Nomi</span></button>
-    <button type="button" (click)="clear()" matTooltip="Rimuovi tutto"><mat-icon>delete_sweep</mat-icon><span>Clear</span></button>
-  </div>
+    <div class="sun">
+      <mat-icon>{{ sunIcon() }}</mat-icon>
+      <mat-slider min="0" max="24" step="0.25">
+        <input matSliderThumb [value]="sunHour()" (input)="setSun(+$any($event.target).value)" />
+      </mat-slider>
+      <span class="time">{{ sunLabel() }}</span>
+    </div>
 
-  <div class="sun">
-    <mat-icon>{{ sunIcon() }}</mat-icon>
-    <mat-slider min="0" max="24" step="0.25">
-      <input matSliderThumb [value]="sunHour()" (valueChange)="setSun($event)" (input)="setSun(+$any($event.target).value)" />
-    </mat-slider>
-    <span class="time">{{ sunLabel() }}</span>
-  </div>
-
-  <div class="hint">{{ hint() }}</div>
-</aside>
+    <div class="hint">{{ hint() }}</div>
+  </mat-card-content>
+</mat-card>
 
 <!-- ============ stats ============ -->
-<div class="stats">
-  <span matTooltip="Esplosioni"><mat-icon>local_fire_department</mat-icon><b>{{ stats().count }}</b></span>
-  <span matTooltip="Area rasa al suolo (5 psi)"><mat-icon>radar</mat-icon><b>{{ areaLabel() }}</b> km²</span>
-  <span matTooltip="Fungo più alto"><mat-icon>cloud</mat-icon><b>{{ cloudLabel() }}</b> km</span>
-  <button type="button" class="trophy" (click)="showAch.set(!showAch())" matTooltip="Trofei"><mat-icon>emoji_events</mat-icon><b>{{ unlocked().size }}/{{ ach.length }}</b></button>
-</div>
+<mat-card class="stats" appearance="raised">
+  <mat-chip-set>
+    <mat-chip matTooltip="Blasts"><mat-icon matChipAvatar>local_fire_department</mat-icon>{{ stats().count }}</mat-chip>
+    <mat-chip matTooltip="Area flattened (5 psi)"><mat-icon matChipAvatar>radar</mat-icon>{{ areaLabel() }} km²</mat-chip>
+    <mat-chip matTooltip="Tallest cloud"><mat-icon matChipAvatar>cloud</mat-icon>{{ cloudLabel() }} km</mat-chip>
+    @if (abducted()) {
+      <mat-chip matTooltip="People beamed up"><mat-icon matChipAvatar>person_raised_hand</mat-icon>{{ abducted() }}</mat-chip>
+    }
+  </mat-chip-set>
+  <button mat-stroked-button class="trophy" (click)="showAch.set(!showAch())"><mat-icon>emoji_events</mat-icon>{{ unlocked().size }}/{{ ach.length }}</button>
+</mat-card>
 
 @if (showAch()) {
-  <div class="card ach">
-    <div class="card-title">Trofei</div>
-    @for (a of ach; track a[0]) {
-      <div class="a" [class.got]="unlocked().has(a[0])">
-        <span class="e">{{ a[1] }}</span>
-        <span><b>{{ a[2] }}</b><small>{{ a[3] }}</small></span>
-      </div>
-    }
-  </div>
+  <mat-card class="ach" appearance="raised">
+    <mat-card-header><mat-card-title>Trophies</mat-card-title></mat-card-header>
+    <mat-list>
+      @for (a of ach; track a[0]) {
+        <mat-list-item [class.locked]="!unlocked().has(a[0])">
+          <span matListItemAvatar class="ach-ico">{{ a[1] }}</span>
+          <span matListItemTitle>{{ a[2] }}</span>
+          <span matListItemLine>{{ a[3] }}</span>
+        </mat-list-item>
+      }
+    </mat-list>
+  </mat-card>
 }
 
-<div class="toasts">
-  @for (t of toasts(); track t.id) {
-    <div class="toast"><span class="e">{{ t.emoji }}</span><span [innerHTML]="t.html"></span></div>
-  }
-</div>
-
 @if (status()) {
-  <div class="status">{{ status() }}</div>
+  <mat-card class="status" appearance="raised"><mat-icon>info</mat-icon>{{ status() }}</mat-card>
 }
 
 <!-- ============ saved places ============ -->
 <div class="places">
   @for (p of places(); track p.id) {
-    <button type="button" class="place" (click)="go(p)" [matTooltip]="'Vai a ' + p.name">
-      <img [src]="p.thumb" alt="" />
-      <span class="pl-name">{{ p.name }}</span>
-      <span class="del" (click)="remove(p, $event)" matTooltip="Elimina"><mat-icon>close</mat-icon></span>
-    </button>
+    <mat-card class="place" appearance="raised" (click)="go(p)" [matTooltip]="'Teleport to ' + p.name">
+      <img mat-card-image [src]="p.thumb" alt="" />
+      <div class="pl-name">{{ p.name }}</div>
+      <button mat-icon-button class="del" (click)="remove(p, $event)" matTooltip="Delete"><mat-icon>close</mat-icon></button>
+    </mat-card>
   }
   @if (saving()) {
-    <div class="save-form">
-      <input #nm type="text" placeholder="Nome del luogo" (keydown.enter)="confirmSave(nm)" autofocus />
-      <button type="button" class="ok" (click)="confirmSave(nm)"><mat-icon>check</mat-icon></button>
-      <button type="button" (click)="saving.set(false)"><mat-icon>close</mat-icon></button>
-    </div>
+    <mat-card class="save-form" appearance="raised">
+      <mat-form-field appearance="outline" subscriptSizing="dynamic">
+        <mat-label>Place name</mat-label>
+        <input #nm matInput (keydown.enter)="confirmSave(nm)" autofocus />
+      </mat-form-field>
+      <button mat-icon-button (click)="confirmSave(nm)" matTooltip="Save"><mat-icon>check</mat-icon></button>
+      <button mat-icon-button (click)="saving.set(false)" matTooltip="Cancel"><mat-icon>close</mat-icon></button>
+    </mat-card>
   } @else {
-    <button type="button" class="place add" (click)="startSave()" matTooltip="Salva la vista attuale">
+    <mat-card class="place add" appearance="outlined" (click)="saving.set(true)" matTooltip="Save the current view">
       <mat-icon>add_location_alt</mat-icon>
-      <span>Salva luogo</span>
-    </button>
+      <span>Save place</span>
+    </mat-card>
   }
 </div>
 
 <!-- ============ info ============ -->
-<button type="button" class="info-btn" (click)="showInfo.set(!showInfo())"><mat-icon>info</mat-icon> Dati e comandi</button>
+<button mat-stroked-button class="info-btn" (click)="showInfo.set(!showInfo())"><mat-icon>info</mat-icon>Info & controls</button>
 @if (showInfo()) {
-  <div class="card info">
+  <mat-card class="info" appearance="raised">
     @if (radii().length) {
-      <div class="card-title">{{ tool().name }}</div>
-      @for (r of radii(); track r[0]) {
-        <div class="r"><span><i [style.background]="r[2]"></i>{{ r[0] }}</span><b>{{ km(r[1]) }}</b></div>
-      }
-      <div class="sep"></div>
+      <mat-card-header><mat-card-title>{{ tool().name }}</mat-card-title><mat-card-subtitle>Effect radii</mat-card-subtitle></mat-card-header>
+      <mat-list dense>
+        @for (r of radii(); track r[0]) {
+          <mat-list-item>
+            <span matListItemAvatar class="dot" [style.background]="r[2]"></span>
+            <span matListItemTitle>{{ r[0] }}</span>
+            <span matListItemMeta class="meta">{{ km(r[1]) }}</span>
+          </mat-list-item>
+        }
+      </mat-list>
+      <mat-divider />
     }
-    <div class="card-title">Comandi</div>
-    <p>Trascina: sposta · Rotella / destro: zoom<br />
-      Rotella premuta o Shift+trascina: ruota e inclina<br />
-      Ctrl+trascina: guarda intorno · Doppio clic: zoom<br />
-      <kbd>D</kbd> drop · <kbd>K</kbd> catena · <kbd>L</kbd> nomi · <kbd>Esc</kbd> esci<br />
-      <kbd>N</kbd> nord · <kbd>U</kbd> dall'alto · <kbd>R</kbd> entrambi</p>
-    <div class="sep"></div>
-    <p>Raggi stimati con le leggi di scala di Glasstone &amp; Dolan (come NUKEMAP). Asteroidi e assurdità: numeri per divertimento.</p>
-    <div class="sep"></div>
-    <p>Token Cesium ion, se la mappa non carica (gratis su <a href="https://ion.cesium.com/signup" target="_blank" rel="noopener">ion.cesium.com</a>):</p>
-    <input #tk class="token" type="text" [value]="token()" placeholder="incolla e premi Invio" (keydown.enter)="saveToken(tk.value)" />
-  </div>
+    <mat-card-content>
+      <h4>Controls</h4>
+      <p>Drag: pan · Wheel / right-drag: zoom<br />
+        Middle-drag or Shift+drag: rotate & tilt<br />
+        Ctrl+drag: look around · Double-click: zoom in<br />
+        <kbd>D</kbd> arm · <kbd>K</kbd> chain · <kbd>L</kbd> labels · <kbd>Esc</kbd> disarm<br />
+        <kbd>N</kbd> north up · <kbd>U</kbd> top-down · <kbd>R</kbd> reset view</p>
+      <mat-divider />
+      <p>Radii from Glasstone &amp; Dolan scaling laws (like NUKEMAP). Asteroids and weird stuff: numbers just for fun.</p>
+      <mat-divider />
+      <mat-form-field appearance="outline" subscriptSizing="dynamic" class="token">
+        <mat-label>Cesium ion token</mat-label>
+        <input #tk matInput [value]="token()" placeholder="paste and press Enter" (keydown.enter)="saveToken(tk.value)" />
+        <mat-hint>Free at ion.cesium.com — only if the map stops loading</mat-hint>
+      </mat-form-field>
+    </mat-card-content>
+  </mat-card>
 }
 
-<button type="button" class="compass" (click)="northUp()" matTooltip="Nord in alto (N)">
-  <svg viewBox="0 0 34 34" [style.transform]="'rotate(' + -heading() + 'deg)'"><path d="M17 3 L21.5 17 L12.5 17 Z" fill="#ff5f4a" /><path d="M17 31 L21.5 17 L12.5 17 Z" fill="#c9cfd8" /></svg>
+<button mat-fab class="reset" (click)="reset()" matTooltip="Reset view: north up, top-down (R)" matTooltipPosition="left">
+  <svg viewBox="0 0 34 34" [style.transform]="'rotate(' + -heading() + 'deg)'"><path d="M17 3 L21.5 17 L12.5 17 Z" fill="#ff5f4a" /><path d="M17 31 L21.5 17 L12.5 17 Z" fill="currentColor" /></svg>
 </button>

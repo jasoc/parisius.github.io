@@ -10,6 +10,7 @@ export interface EngineEvents {
   hint(text: string): void;
   status(text: string): void;
   heading(deg: number): void;
+  abducted(n: number): void;
 }
 
 export interface SavedView { lon: number; lat: number; h: number; heading: number; pitch: number; roll: number; }
@@ -109,6 +110,40 @@ function makeTurretTex() {
   return c;
 }
 
+function makeUfoTex() {
+  const c = document.createElement('canvas'); c.width = 256; c.height = 128;
+  const g = c.getContext('2d');
+  // underside glow
+  const glow = g.createRadialGradient(128, 92, 4, 128, 92, 60);
+  glow.addColorStop(0, 'rgba(170,255,190,.9)'); glow.addColorStop(1, 'rgba(170,255,190,0)');
+  g.fillStyle = glow; g.fillRect(0, 50, 256, 78);
+  // dome
+  const dome = g.createRadialGradient(118, 42, 4, 128, 56, 46);
+  dome.addColorStop(0, 'rgba(230,255,255,.95)'); dome.addColorStop(0.6, 'rgba(120,220,235,.75)'); dome.addColorStop(1, 'rgba(40,110,140,.8)');
+  g.fillStyle = dome; g.beginPath(); g.ellipse(128, 62, 44, 36, 0, Math.PI, 0); g.fill();
+  // disc
+  const disc = g.createLinearGradient(0, 56, 0, 92);
+  disc.addColorStop(0, '#e9edf2'); disc.addColorStop(0.45, '#9aa3ad'); disc.addColorStop(1, '#4a5058');
+  g.fillStyle = disc; g.beginPath(); g.ellipse(128, 72, 122, 20, 0, 0, Math.PI * 2); g.fill();
+  g.strokeStyle = 'rgba(0,0,0,.35)'; g.lineWidth = 2; g.stroke();
+  // lights
+  for (let i = 0; i < 9; i++) {
+    const x = 30 + i * 24.5, y = 74 + Math.sin((i / 8) * Math.PI) * 6;
+    g.fillStyle = ['#ffef6b', '#7dffb0', '#ff6bd5'][i % 3];
+    g.beginPath(); g.arc(x, y, 5, 0, Math.PI * 2); g.fill();
+  }
+  return c;
+}
+function makePersonTex() {
+  const c = document.createElement('canvas'); c.width = 16; c.height = 32;
+  const g = c.getContext('2d');
+  g.fillStyle = '#f2f2f2'; g.strokeStyle = '#f2f2f2'; g.lineWidth = 2.4; g.lineCap = 'round';
+  g.beginPath(); g.arc(8, 5, 3.6, 0, Math.PI * 2); g.fill();
+  g.beginPath(); g.moveTo(8, 9); g.lineTo(8, 20); g.moveTo(8, 12); g.lineTo(2, 7); g.moveTo(8, 12); g.lineTo(14, 7);
+  g.moveTo(8, 20); g.lineTo(3, 30); g.moveTo(8, 20); g.lineTo(13, 30); g.stroke();
+  return c;
+}
+
 // ---------------------------------------------------------------------------
 // The engine
 // ---------------------------------------------------------------------------
@@ -136,6 +171,7 @@ export class NukeEngine {
   private drag = null;
   private tileset = null; private labGlobe = null; private labTiles = null;
   private puffTex = makePuffTex(); private glowTex = makeGlowTex(); private jetTex = makeJetTex(); private turretTex = makeTurretTex();
+  private ufoTex = makeUfoTex(); private personTex = makePersonTex();
   private actx = null; private master = null; private noiseBuf = null; private lastSmallSound = 0;
   private geocoder;
 
@@ -144,9 +180,11 @@ export class NukeEngine {
     const viewer = (this.viewer = new Cesium.Viewer(container, {
       baseLayer: false, geocoder: false, animation: false, timeline: false, baseLayerPicker: false, homeButton: false,
       sceneModePicker: false, navigationHelpButton: false, fullscreenButton: false, infoBox: false,
-      selectionIndicator: false, msaaSamples: 4,
+      selectionIndicator: false, msaaSamples: 2,
+      // performance: only render when something changes (camera, tiles, or our own animations, see needsFrames)
+      requestRenderMode: true, maximumRenderTimeChange: Infinity,
     }));
-    viewer.useBrowserRecommendedResolution = false;
+    viewer.useBrowserRecommendedResolution = true; // CSS-pixel resolution: on HiDPI screens 4x fewer pixels to shade
     const scene = (this.scene = viewer.scene), camera = (this.camera = viewer.camera);
     this.cv = scene.canvas;
     viewer.clock.shouldAnimate = false;
@@ -162,7 +200,7 @@ export class NukeEngine {
     this.puffs = scene.primitives.add(new Cesium.BillboardCollection({ blendOption: Cesium.BlendOption.TRANSLUCENT }));
     // one collection per texture: mixing differently sized canvases in one atlas breaks it (WebGL copy errors)
     const col = () => scene.primitives.add(new Cesium.BillboardCollection({ blendOption: Cesium.BlendOption.TRANSLUCENT }));
-    this.cols = { puff: col(), glow: col(), jet: col(), misc: col() };
+    this.cols = { puff: col(), glow: col(), jet: col(), misc: col(), ufo: col(), person: col() };
     this.setupControls();
     this.loadGoogle();
 
@@ -173,7 +211,24 @@ export class NukeEngine {
     };
     scene.preRender.addEventListener(onPre);
     this.disposers.push(() => scene.preRender.removeEventListener(onPre));
+
+    // drive frames only while something is animating; Cesium renders camera moves and tile loads by itself
+    let raf = 0;
+    const tick = () => {
+      if (this.needsFrames()) scene.requestRender();
+      else last = performance.now(); // no time jump when animations resume
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    this.disposers.push(() => cancelAnimationFrame(raf));
   }
+
+  private needsFrames() {
+    return this.blasts.some((D) => D.t < D.E.Trise * 3 || !D.heard) || this.flyers.length > 0 || this.particles.length > 0 ||
+      this.bombs.length > 0 || this.turrets.length > 0 || this.ufos.length > 0 || this.ducks.some((d) => !d.rest) ||
+      this.shake.amp > 0 || this.keys.size > 0 || this.recentering || this.FLASH > 0.001;
+  }
+  private poke() { this.scene?.requestRender(); }
 
   dispose() {
     this.disposers.forEach((d) => d());
@@ -197,7 +252,7 @@ export class NukeEngine {
       if (this.viewer.isDestroyed()) return;
       this.scene.globe.show = true;
       const busy = String(e.statusCode || e.message || e).includes('429');
-      this.ev.status(busy ? `Google 3D occupato (token di prova condiviso), riprovo… (${attempt})` : 'Google 3D non disponibile: serve un token Cesium ion.');
+      this.ev.status(busy ? `Google 3D is busy (shared trial token), retrying… (${attempt})` : 'Google 3D unavailable: a Cesium ion token is needed.');
       if (busy && attempt < 20) { const id = setTimeout(() => this.loadGoogle(attempt + 1), 8000); this.disposers.push(() => clearTimeout(id)); }
     }
   }
@@ -345,8 +400,9 @@ export class NukeEngine {
     on(document, 'keydown', (e) => {
       if (isField(e.target)) return;
       const k = e.key.toLowerCase();
-      if (k === 'n' || k === 'r') this.northUp();
-      if (k === 'u' || k === 'r') this.topDown();
+      if (k === 'n') this.northUp();
+      if (k === 'u') this.topDown();
+      if (k === 'r') this.reset();
       this.keys.add(e.key);
       if (e.key.startsWith('Arrow') || e.key.startsWith('Page')) e.preventDefault();
     });
@@ -390,13 +446,29 @@ export class NukeEngine {
   }
 
   // ======================================================================= public setters
-  setTool(t: Tool) { this.tool = t; this.cancelLine(); this.updateHint(); }
-  setArmed(v: boolean) { this.armed = v; this.cv.style.cursor = v ? 'crosshair' : ''; if (!v) this.cancelLine(); this.updateHint(); }
+  setTool(t: Tool) {
+    // the silo belongs to the ICBM tool only: leaving it removes the silo
+    if (t.kind !== 'icbm') this.removeBase();
+    this.tool = t; this.cancelLine(); this.updateHint();
+  }
+  setArmed(v: boolean) { this.armed = v; this.cv.style.cursor = v ? 'crosshair' : ''; if (!v) { this.cancelLine(); this.removeBase(); } this.updateHint(); }
   setChain(v: boolean) { this.chain = v; }
   setSound(v: boolean) { this.soundOn = v; if (v) this.audio(); }
   setRings(v: boolean) {
     this.showRings = v;
     for (const D of this.blasts) { D.entities.forEach((e) => (e.show = v)); D.groundMat.uniforms.rings = v ? 1 : 0; }
+    this.poke();
+  }
+  private removeBase() {
+    if (this.base) { this.viewer.entities.remove(this.base.entity); this.base = null; this.poke(); }
+  }
+
+  /** Full reset: straight down, north up, over the point we are above (fixes any "looking at the sky" mess). */
+  reset() {
+    const c = Cesium.Cartographic.fromCartesian(this.camera.positionWC);
+    const h = Cesium.Math.clamp(c.height, 1500, 2.0e7);
+    this.drag = null;
+    this.camera.flyTo({ destination: Cesium.Cartesian3.fromRadians(c.longitude, c.latitude, h), orientation: { heading: 0, pitch: -Cesium.Math.PI_OVER_TWO, roll: 0 }, duration: 0.8 });
   }
   setLabels(on: boolean) {
     this.labelsOn = on;
@@ -408,7 +480,7 @@ export class NukeEngine {
     this.labGlobe = this.viewer.imageryLayers.addImageryProvider(prov());
     if (this.tileset) this.labTiles = this.tileset.imageryLayers.addImageryProvider(prov());
   }
-  setSunHour(h: number) { this.sunHour = h; }
+  setSunHour(h: number) { this.sunHour = h; this.poke(); }
 
   async search(text: string): Promise<boolean> {
     try {
@@ -426,10 +498,12 @@ export class NukeEngine {
     this.ducks.forEach((d) => { d.model && this.scene.primitives.remove(d.model); d.bb && this.rm(d.bb); }); this.ducks = [];
     this.turrets.forEach((t) => this.viewer.entities.remove(t.entity)); this.turrets = [];
     this.bombs.forEach((b) => this.rm(b.b)); this.bombs = [];
-    if (this.base) { this.viewer.entities.remove(this.base.entity); this.base = null; }
+    this.ufos.forEach((u) => this.removeUfo(u)); this.ufos = [];
+    this.removeBase();
     this.cancelLine();
     this.FLASH = this.WARM = 0;
     this.updateHint();
+    this.poke();
   }
 
   // ---- saved places ----
@@ -456,22 +530,26 @@ export class NukeEngine {
   // ======================================================================= acting on a click
   private updateHint() {
     const k = this.tool.kind;
-    if (!this.armed) return this.ev.hint('Premi D o DROP, poi clicca sulla mappa');
-    if (k === 'icbm' || k === 'cruise') return this.ev.hint(this.base ? 'Clicca il bersaglio · Alt+clic sposta la base' : 'Clicca dove mettere la base di lancio');
-    if (k === 'railgun') return this.ev.hint(`Clicca per piazzare una torretta (${this.turrets.length}/4)`);
-    if (k === 'carpet') return this.ev.hint(this.lineStart ? 'Clicca la fine della linea' : 'Clicca l’inizio della linea di bombardamento');
-    this.ev.hint('Clicca sulla mappa · Esc per uscire');
+    if (!this.armed) return this.ev.hint('Press D or ARM, then click the map');
+    if (k === 'icbm') return this.ev.hint(this.base ? 'Click a target · Alt+click moves the silo' : 'Click where to place your silo');
+    if (k === 'railgun') return this.ev.hint(`Click to place a turret (${this.turrets.length}/4)`);
+    if (k === 'carpet') return this.ev.hint(this.lineStart ? 'Click the end of the line' : 'Click the start of the bombing line');
+    if (k === 'ufo') return this.ev.hint(`Click to summon a UFO (${this.ufos.length}/4)`);
+    this.ev.hint('Click the map · Esc to disarm');
   }
 
   private act(p, alt) {
     const w = this.tool;
     this.audio();
+    this.poke();
     switch (w.kind) {
       case 'duck': return this.dropDuck(p);
+      case 'ufo': return this.spawnUfo(p);
       case 'asteroid': case 'rod': return this.fireFromSky(p, w);
-      case 'icbm': case 'cruise':
+      case 'cruise': return this.fireCruise(p, w);
+      case 'icbm':
         if (!this.base || alt) return this.setBase(p);
-        return w.kind === 'icbm' ? this.fireIcbm(p, w) : this.fireCruise(p, w);
+        return this.fireIcbm(p, w);
       case 'railgun': return this.placeTurret(p);
       case 'carpet':
         if (!this.lineStart) return this.startLine(p);
@@ -934,8 +1012,12 @@ export class NukeEngine {
       onArrive: () => { this.detonate(target, w); if (dist >= 5.5e6) this.ev.unlock('icbm'); },
     });
   }
+  /** No silo: it comes in low from behind the camera, 25 km out, and hugs the terrain to the target. */
   private fireCruise(target, w) {
-    const { path, dist } = this.geoPath(this.base.pos, target, (s, d) => 300 * smooth(0, Math.min(0.08, 3000 / d), s) * (1 - smooth(1 - Math.min(0.06, 2000 / d), 1, s)));
+    const C3 = Cesium.Cartesian3, enu = Cesium.Transforms.eastNorthUpToFixedFrame(target);
+    const hd = this.camera.heading + Math.PI + (Math.random() - 0.5) * 0.5, R = 25000;
+    const start = Cesium.Matrix4.multiplyByPoint(enu, new C3(Math.sin(hd) * R, Math.cos(hd) * R, 0), new C3());
+    const { path, dist } = this.geoPath(start, target, (s, d) => 300 * (1 - smooth(1 - Math.min(0.08, 2000 / d), 1, s)));
     const dur = Cesium.Math.clamp(dist / 2500, 2, 12);
     this.whoosh(Math.min(2, dur), 1.6);
     this.launchFlyer({
@@ -1040,6 +1122,76 @@ export class NukeEngine {
     }
   }
 
+  // ---- UFOs ----
+  private ufos = [];
+  private abducted = 0;
+  private spawnUfo(target) {
+    if (this.ufos.length >= 4) this.removeUfo(this.ufos.shift());
+    const C3 = Cesium.Cartesian3, enu = Cesium.Transforms.eastNorthUpToFixedFrame(target);
+    const hover = 420, beamR = 110;
+    const a = Math.random() * Math.PI * 2;
+    const u: any = {
+      enu, hover, beamR, t: 0, arrive: 3.2, beam: null, glow: null, people: [], spawn: 0,
+      from: [Math.cos(a) * 9000, Math.sin(a) * 9000, 5500],
+      body: this.bb(null, 'ufo', { sizeInMeters: true, width: 170, height: 85, position: target }),
+    };
+    this.ufos.push(u);
+    this.theremin();
+    this.updateHint();
+  }
+  private removeUfo(u) {
+    this.rm(u.body);
+    if (u.glow) this.rm(u.glow);
+    if (u.beam) this.viewer.entities.remove(u.beam);
+    u.people.forEach((p) => this.rm(p.b));
+  }
+  private updateUfos(dt) {
+    const C3 = Cesium.Cartesian3;
+    for (const u of this.ufos) {
+      u.t += dt;
+      const s = smooth(0, u.arrive, u.t);
+      const bob = 7 * Math.sin(u.t * 1.6);
+      const x = lerp(u.from[0], 0, s), y = lerp(u.from[1], 0, s), z = lerp(u.from[2], u.hover, s) + bob * s;
+      u.body.position = Cesium.Matrix4.multiplyByPoint(u.enu, new C3(x, y, z), new C3());
+      if (u.t < u.arrive) continue;
+      if (!u.beam) {
+        u.beam = this.viewer.entities.add({
+          position: Cesium.Matrix4.multiplyByPoint(u.enu, new C3(0, 0, u.hover / 2 - 10), new C3()),
+          cylinder: { length: u.hover - 20, topRadius: 22, bottomRadius: u.beamR, material: Cesium.Color.fromCssColorString('#a8ffbf').withAlpha(0.17), outline: false },
+        });
+        u.glow = this.bb(null, 'glow', { sizeInMeters: true, width: u.beamR * 2.6, height: u.beamR * 2.6, position: Cesium.Matrix4.multiplyByPoint(u.enu, new C3(0, 0, 3), new C3()), color: new Cesium.Color(0.6, 1, 0.7, 0.35) });
+        this.ev.unlock('ufo');
+      }
+      // a new person every so often, somewhere inside the beam
+      u.spawn -= dt;
+      if (u.spawn <= 0) {
+        u.spawn = 0.18 + Math.random() * 0.25;
+        const r = Math.sqrt(Math.random()) * u.beamR * 0.9, th = Math.random() * Math.PI * 2;
+        u.people.push({ r, th, z: 0, v: 3, spin: (Math.random() < 0.5 ? -1 : 1) * (0.6 + Math.random() * 0.6), b: this.bb(null, 'person', { sizeInMeters: true, width: 9, height: 18, verticalOrigin: Cesium.VerticalOrigin.BOTTOM }) });
+      }
+      for (let i = u.people.length - 1; i >= 0; i--) {
+        const p = u.people[i];
+        p.v = Math.min(45, p.v + 6 * dt); // slow at first, then faster
+        p.z += p.v * dt;
+        p.th += p.spin * dt;
+        const k = p.z / u.hover, rr = p.r * (1 - 0.85 * k);
+        p.b.position = Cesium.Matrix4.multiplyByPoint(u.enu, new C3(rr * Math.cos(p.th), rr * Math.sin(p.th), p.z), new C3());
+        p.b.rotation = p.th * 0.7;
+        p.b.color = new Cesium.Color(1, 1, 1, 1 - smooth(0.85, 1, k));
+        if (p.z >= u.hover - 25) { this.rm(p.b); u.people.splice(i, 1); this.abducted++; this.ev.abducted(this.abducted); }
+      }
+    }
+  }
+  private theremin() {
+    const a = this.audio(); if (!a) return;
+    const t = a.currentTime, o = a.createOscillator(), vib = a.createOscillator(), vg = a.createGain(), g = a.createGain();
+    o.type = 'sine';
+    o.frequency.setValueAtTime(420, t); o.frequency.exponentialRampToValueAtTime(980, t + 0.9); o.frequency.exponentialRampToValueAtTime(610, t + 2.2);
+    vib.frequency.value = 6; vg.gain.value = 22; vib.connect(vg); vg.connect(o.frequency);
+    o.connect(g); g.connect(this.master); this.env(g, t, 0.16, 0.25, 2.4);
+    o.start(t); vib.start(t); o.stop(t + 2.8); vib.stop(t + 2.8);
+  }
+
   // ---- rubber duck ----
   private async dropDuck(groundPos) {
     const C3 = Cesium.Cartesian3, enu = Cesium.Transforms.eastNorthUpToFixedFrame(groundPos), HEIGHT = 250;
@@ -1090,7 +1242,7 @@ export class NukeEngine {
   /** Billboard with a shared texture: a canvas passed as `image` would be copied into the atlas once per billboard. */
   private bb(col, id, opts) {
     const b = (col || this.cols[id]).add(opts);
-    b.setImage(id, { puff: this.puffTex, glow: this.glowTex, jet: this.jetTex }[id]);
+    b.setImage(id, { puff: this.puffTex, glow: this.glowTex, jet: this.jetTex, ufo: this.ufoTex, person: this.personTex }[id]);
     return b;
   }
   private rm(b) { b._billboardCollection?.remove(b); }
@@ -1102,14 +1254,31 @@ export class NukeEngine {
     }
   }
 
+  /** Google Earth feel: the further out you zoom, the more the view tilts back to straight down, so the globe stays centred. */
+  private recentering = false;
+  private recenter(dt) {
+    const cam = this.camera, h = Cesium.Cartographic.fromCartesian(cam.positionWC).height;
+    const k = smooth(150e3, 2.5e6, h);
+    const target = -Cesium.Math.PI_OVER_TWO;
+    const diff = target - cam.pitch;
+    this.recentering = false;
+    if (this.drag || k <= 0 || (Math.abs(diff) < 0.002 && Math.abs(cam.roll) < 0.002)) return;
+    this.recentering = true;
+    const f = Math.min(1, dt * 3 * k);
+    cam.setView({ orientation: { heading: cam.heading, pitch: cam.pitch + diff * f, roll: cam.roll * (1 - f) } });
+  }
+
+  private lastHeading = 999;
   private frame(dt) {
     this.applyShake(dt);
     this.handleKeys(dt);
+    this.recenter(dt);
     this.updateSun();
-    this.ev.heading(Cesium.Math.toDegrees(this.camera.heading));
+    const hd = Cesium.Math.toDegrees(this.camera.heading);
+    if (Math.abs(hd - this.lastHeading) > 0.5) { this.lastHeading = hd; this.ev.heading(hd); }
     this.noDepth(this.puffs); Object.values(this.cols).forEach((c) => this.noDepth(c));
 
-    this.updateFlyers(dt); this.updateBombs(dt); this.updateParticles(dt); this.updateDucks(dt); this.updateTurrets(dt);
+    this.updateFlyers(dt); this.updateBombs(dt); this.updateParticles(dt); this.updateDucks(dt); this.updateTurrets(dt); this.updateUfos(dt);
 
     // every cloud of every blast goes into ONE collection, sorted far → near, so overlapping clouds blend correctly
     const items = [];
