@@ -90,6 +90,16 @@ Not checked: a hilly city or coast (Milan only), a moving-camera visual check fo
   altitude), so the margin hit its 12 m cap.
 - Not done: the optional camera-following regional map; the antimeridian splat wraps but was not tested.
 
+## Fix: no collapse right after page load
+
+- Until `tileset.tilesLoaded` first becomes true (~8 s after load), `pickPosition` and `sampleHeight` hit very
+  coarse tiles: -26 km, then +1166 m over Milan (true ground ~170 m). A click in that window put the blast
+  origin 1 km up, and a calibration sampled then put the "ground" 980 m up, shared with every later blast
+  within 5 km: nothing collapsed. My earlier tests always waited for the tiles, so they never saw it.
+- Now: height sampling waits (≤ 3 s) for loaded tiles; a calibration with |offset| > 150 m is rejected and never
+  shared; a blast whose origin is > 150 m off its ground estimate is moved onto it when its heightmap lands.
+- Verified: clicking 3 s after load (origin picked at 1166 m) re-anchors to 159 m and the city collapses.
+
 ## Phase 5 notes (debris)
 
 - Chunks spawn in the band the collapse front just crossed, at a rate set by the blast's "urban" share (fraction

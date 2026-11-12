@@ -568,7 +568,10 @@ export class NukeEngine {
   /** sampleHeight costs ~10 ms (an offscreen pick): CPU work like that goes through this queue, ≤ 8 ms per frame */
   private runJobs() {
     const t0 = performance.now();
-    if (this.jobs.length) { const restore = this.hideForSampling(); try { while (this.jobs.length && performance.now() - t0 < 8) { if (this.jobs[0]()) this.jobs.shift(); } } finally { restore(); } }
+    if (this.jobs.length) {
+      const restore = this.hideForSampling();
+      try { while (this.jobs.length && performance.now() - t0 < 8) { const r = this.jobs[0](); if (r === 'wait') break; if (r) this.jobs.shift(); } } finally { restore(); }
+    }
     if (this.mapDirty && performance.now() - this.lastMap > 250) { // ≤ 4 uploads a second (8 MB each)
       this.mapDirty = false; this.lastMap = performance.now();
       this.bShader.setUniform('u_map', this.mapUniform());
@@ -613,8 +616,11 @@ export class NukeEngine {
     /** Google heights (relative to h0) at blast-local points, through the frame-budgeted job queue */
     const sample = (pts) => new Promise((resolve) => {
       const out = pts.map(() => null); let k = 0;
+      let wait = 0;
       this.jobs.push(() => {
         if (Q.dead) { resolve(out); return true; }
+        // while tiles are still loading, sampleHeight hits coarse LODs (seen: -26 km, then +1 km right after load)
+        if (!this.tileset.tilesLoaded && (wait ||= performance.now()) && performance.now() - wait < 3000) return 'wait';
         const [x, y] = pts[k]; const h = this.sampleH(cartoAt(x, y)); if (h !== undefined) out[k] = { x, y, h: h - h0 };
         if (++k >= pts.length) { resolve(out); return true; }
         return false;
@@ -634,7 +640,7 @@ export class NukeEngine {
       .catch(() => null);
     const at = (dtm, x, y) => { const gx = Math.max(0, Math.min(N - 1.001, ((x / S) * 0.5 + 0.5) * (N - 1))), gy = Math.max(0, Math.min(N - 1.001, ((y / S) * 0.5 + 0.5) * (N - 1))); const i = Math.floor(gx), j = Math.floor(gy), fx = gx - i, fy = gy - j, g = (a, b) => dtm[b * N + a]; return lerp(lerp(g(i, j), g(i + 1, j), fx), lerp(g(i, j + 1), g(i + 1, j + 1), fx), fy); };
     // Google - terrain is a regional offset: a prep within ~5 km of another reuses its calibration (no sampling)
-    const donor = this.preps.find((q) => !q.dead && q.calP && C3.distance(q.origin, origin) < Math.max(5000, 2 * S));
+    const donor = this.preps.find((q) => !q.dead && q.calP && q.calOk !== false && C3.distance(q.origin, origin) < Math.max(5000, 2 * S));
     if (donor) Q.calP = donor.calP;
     else {
       // 12 clusters of 4 Google samples within ~30 m: the lowest of each is most likely a street or courtyard
@@ -652,12 +658,16 @@ export class NukeEngine {
         // it gets wrong are not flattened as if they were buildings; only the upper floors fall there
         const iqr = res.length >= 4 ? res[Math.floor(res.length * 0.75)] - res[Math.floor(res.length * 0.25)] : 0;
         const off = res[res.length >> 1], ok = got.filter(Boolean);
+        // real Google-vs-terrain offsets are tens of metres. Right after load the tiles are still coarse and
+        // sampleHeight can be ~1 km off: such a calibration put the "ground" 980 m up and nothing collapsed
+        if (Math.abs(off) > 150) return null;
         // share of samples standing > 6 m above the ground estimate: how built-up the place is (debris rate)
         const urban = ok.length ? ok.filter((q) => q.h - at(dtm, q.x, q.y) - off > 6).length / ok.length : 0.3;
         return { off, margin: Math.min(12, 0.75 * iqr), res, urban };
       });
     }
     Promise.all([Q.dtmP, Q.calP]).then(async ([dtm, cal]) => {
+      Q.calOk = !!cal; // a rejected calibration is never shared with later preps
       if (Q.dead) return;
       const hm = new Float32Array(N * N);
       if (dtm) {
@@ -696,6 +706,16 @@ export class NukeEngine {
   private applyPrep(D, Q) {
     const h0 = Cesium.Cartographic.fromCartesian(D.origin).height, dz = Q.h0 - h0;
     D.hm = dz ? Q.hm.map((v) => v + dz) : Q.hm; D.h0 = h0; D.hmS = Q.S;
+    // A click during the first seconds after load lands on coarse tiles (~1 km off): if ground zero is far from
+    // the ground estimate, the whole blast moves down (or up) onto it
+    const off = D.hm[32 * 64 + 32] - (Q.margin || 0);
+    if (Math.abs(off) > 150) {
+      const C3 = Cesium.Cartesian3, sh = C3.multiplyByScalar(D.up, off, new C3());
+      C3.add(D.origin, sh, D.origin); C3.add(D.groundPos, sh, D.groundPos);
+      D.enu = Cesium.Transforms.eastNorthUpToFixedFrame(D.groundPos); D.enuO = null;
+      D.invEnu = Cesium.Matrix4.inverseTransformation(Cesium.Transforms.eastNorthUpToFixedFrame(D.origin), new Cesium.Matrix4());
+      D.hm = D.hm.map((v) => v - off); D.h0 += off; D.reanchored = off;
+    }
     D.hmSrc = Q.src; D.hmRes = Q.res; D.hmMargin = Q.margin; D.urban = Q.urban ?? 0.3;
     this.padGen++; // padOf changes once a heightmap exists (leaning blocks)
     this.writeAtlas(D);
@@ -1436,7 +1456,7 @@ export class NukeEngine {
     // every blast stays as a permanent scar until clear(); the 16 shader slots are handed out each frame (schedule)
     const slot = -1;
     const enu = Cesium.Transforms.eastNorthUpToFixedFrame(groundPos);
-    const local = (x, y, z, out?) => Cesium.Matrix4.multiplyByPoint(enu, C3.fromElements(x, y, z, out || new C3()), out || new C3());
+    const local = (x, y, z, out?) => Cesium.Matrix4.multiplyByPoint(D.enu, C3.fromElements(x, y, z, out || new C3()), out || new C3());
     const gen = opts.gen || 0;
     const D: any = {
       E, w, slot, id: ++this.blastId, groundPos, enu, local, cloudA: 1, t: 0, real: 0, shock: 0, burn: 0, glowB: 0, entities: [], rings: {},
