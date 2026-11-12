@@ -1,169 +1,174 @@
 <div #map class="map"></div>
 <div class="tp-fade" [class.on]="teleporting()"></div>
+<input #file type="file" accept="application/json,.json" hidden (change)="onImport(file)" />
 
 @if (loading()) {
-  <div class="loading"><mat-spinner diameter="28" /><span>Loading the globe…</span></div>
+  <div class="loading"><mat-spinner diameter="26" /><span>Loading the globe…</span></div>
 }
 
-<!-- ============ armory ============ -->
-<mat-card class="panel" appearance="raised">
-  <mat-card-header>
-    <div mat-card-avatar class="avatar">☢️</div>
-    <mat-card-title>Nuke Sim</mat-card-title>
-    <mat-card-subtitle>Pick a payload, arm, click the map</mat-card-subtitle>
-  </mat-card-header>
+<!-- ============ arsenal panel (side panel on desktop, bottom sheet on mobile) ============ -->
+@if (panelOpen()) {
+  @if (mobile()) { <div class="scrim" (click)="panelOpen.set(false)"></div> }
+  <section class="panel">
+    @if (mobile()) { <div class="handle" (click)="panelOpen.set(false)"></div> }
+    <header>
+      <span class="title">Nuke Sim</span>
+      <span class="spacer"></span>
+      <button mat-icon-button class="sm" (click)="showInfo.set(!showInfo())" matTooltip="Info & controls"><mat-icon>info</mat-icon></button>
+      <button mat-icon-button class="sm" (click)="panelOpen.set(false)" [matTooltip]="mobile() ? 'Close' : 'Collapse'"><mat-icon>{{ mobile() ? 'expand_more' : 'left_panel_close' }}</mat-icon></button>
+    </header>
 
-  <mat-card-content>
-    <mat-form-field appearance="outline" subscriptSizing="dynamic" class="search">
-      <mat-icon matPrefix>search</mat-icon>
-      <input #q matInput placeholder="Search a place" autocomplete="off" spellcheck="false" (keydown.enter)="search(q)" />
-    </mat-form-field>
+    <label class="search">
+      <mat-icon>search</mat-icon>
+      <input #q type="text" placeholder="Search a place" autocomplete="off" spellcheck="false" (keydown.enter)="search(q)" />
+    </label>
 
-    <mat-card appearance="outlined" class="preview">
-      <mat-card-header>
-        <div mat-card-avatar class="big">{{ tool().icon }}</div>
-        <mat-card-title>{{ tool().name }}</mat-card-title>
-        <mat-card-subtitle>{{ toolMeta() }}</mat-card-subtitle>
-      </mat-card-header>
-      <mat-card-content><p>{{ tool().desc }}</p></mat-card-content>
-    </mat-card>
+    <div class="selected">
+      <span class="sel-ico">{{ tool().icon }}</span>
+      <div class="sel-text">
+        <div class="sel-name">{{ tool().name }}</div>
+        <div class="sel-meta">{{ toolMeta() }}</div>
+      </div>
+    </div>
+    <p class="sel-desc">{{ tool().desc }}</p>
 
     <div class="tools">
       @for (g of groups; track g.name) {
-        <div class="group-label">{{ g.name }}</div>
-        <mat-chip-listbox [value]="tool().id" (change)="pick(toolById($event.value))" [hideSingleSelectionIndicator]="true" aria-label="Payloads">
+        <div class="group">{{ g.name }}</div>
+        <div class="grid">
           @for (t of g.tools; track t.id) {
-            <mat-chip-option [value]="t.id" [matTooltip]="t.desc" matTooltipPosition="right">
-              <span matChipAvatar class="chip-ico">{{ t.icon }}</span>{{ t.name }}
-            </mat-chip-option>
+            <button type="button" class="card" [class.sel]="t.id === tool().id" (click)="pick(t)" [matTooltip]="t.desc" matTooltipShowDelay="500">
+              <span class="ico">{{ t.icon }}</span>
+              <span class="name">{{ t.name }}</span>
+              @if (t.W) { <span class="y">{{ fmtW(t.W) }}</span> }
+            </button>
           }
-        </mat-chip-listbox>
+        </div>
       }
     </div>
 
-    <div class="row">
-      <button mat-flat-button class="arm" [class.armed]="armed()" (click)="toggleArmed()" matTooltip="Arm / disarm (D)">
-        <mat-icon>{{ armed() ? 'gps_fixed' : 'gps_not_fixed' }}</mat-icon>
-        {{ armed() ? 'ARMED' : 'ARM' }}
-      </button>
-      <button mat-stroked-button class="clear" (click)="clear()" matTooltip="Remove everything"><mat-icon>delete_sweep</mat-icon>Clear</button>
-    </div>
-
-    <div class="row">
-      <mat-button-toggle-group multiple hideMultipleSelectionIndicator [value]="toggles()" (change)="setToggles($event.value)" aria-label="Options">
+    <div class="opts">
+      <mat-button-toggle-group multiple hideMultipleSelectionIndicator [value]="opts()" (change)="setOpts($event.value)" aria-label="Options">
+        <mat-button-toggle value="launch" matTooltip="Launch from a silo (M)"><mat-icon>rocket_launch</mat-icon></mat-button-toggle>
         <mat-button-toggle value="chain" matTooltip="Chain reaction (K)"><mat-icon>link</mat-icon></mat-button-toggle>
-        <mat-button-toggle value="sound" matTooltip="Sound"><mat-icon>{{ sound() ? 'volume_up' : 'volume_off' }}</mat-icon></mat-button-toggle>
         <mat-button-toggle value="rings" matTooltip="Damage radii"><mat-icon>track_changes</mat-icon></mat-button-toggle>
-        <mat-button-toggle value="labels" matTooltip="Borders & place names (L)"><mat-icon>map</mat-icon></mat-button-toggle>
+        <mat-button-toggle value="labels" matTooltip="Borders & names (L)"><mat-icon>map</mat-icon></mat-button-toggle>
+        <mat-button-toggle value="sound" matTooltip="Sound"><mat-icon>{{ has('sound') ? 'volume_up' : 'volume_off' }}</mat-icon></mat-button-toggle>
       </mat-button-toggle-group>
     </div>
 
     <div class="sun">
       <mat-icon>{{ sunIcon() }}</mat-icon>
-      <mat-slider min="0" max="24" step="0.25">
+      <mat-slider min="0" max="24" step="0.25" matTooltip="Time of day (UTC): moves the sun, so the lit half of the globe">
         <input matSliderThumb [value]="sunHour()" (input)="setSun(+$any($event.target).value)" />
       </mat-slider>
       <span class="time">{{ sunLabel() }}</span>
     </div>
 
-    <div class="hint">{{ hint() }}</div>
-  </mat-card-content>
-</mat-card>
-
-<!-- ============ stats ============ -->
-<mat-card class="stats" appearance="raised">
-  <mat-chip-set>
-    <mat-chip matTooltip="Blasts"><mat-icon matChipAvatar>local_fire_department</mat-icon>{{ stats().count }}</mat-chip>
-    <mat-chip matTooltip="Area flattened (5 psi)"><mat-icon matChipAvatar>radar</mat-icon>{{ areaLabel() }} km²</mat-chip>
-    <mat-chip matTooltip="Tallest cloud"><mat-icon matChipAvatar>cloud</mat-icon>{{ cloudLabel() }} km</mat-chip>
-    @if (abducted()) {
-      <mat-chip matTooltip="People beamed up"><mat-icon matChipAvatar>person_raised_hand</mat-icon>{{ abducted() }}</mat-chip>
+    @if (!mobile()) {
+      <div class="actions">
+        <button mat-flat-button class="arm" [class.armed]="armed()" (click)="toggleArmed()" matTooltip="Arm / disarm (D)">
+          <mat-icon>{{ armed() ? 'gps_fixed' : 'gps_not_fixed' }}</mat-icon>{{ armed() ? 'Armed' : 'Arm' }}
+        </button>
+        <button mat-icon-button class="tonal" (click)="clear()" matTooltip="Clear everything"><mat-icon>delete_sweep</mat-icon></button>
+      </div>
+      <div class="hint">{{ hint() }}</div>
+    } @else {
+      <button mat-stroked-button class="clear-m" (click)="clear()"><mat-icon>delete_sweep</mat-icon>Clear everything</button>
     }
-  </mat-chip-set>
-  <button mat-stroked-button class="trophy" (click)="showAch.set(!showAch())"><mat-icon>emoji_events</mat-icon>{{ unlocked().size }}/{{ ach.length }}</button>
-</mat-card>
-
-@if (showAch()) {
-  <mat-card class="ach" appearance="raised">
-    <mat-card-header><mat-card-title>Trophies</mat-card-title></mat-card-header>
-    <mat-list>
-      @for (a of ach; track a[0]) {
-        <mat-list-item [class.locked]="!unlocked().has(a[0])">
-          <span matListItemAvatar class="ach-ico">{{ a[1] }}</span>
-          <span matListItemTitle>{{ a[2] }}</span>
-          <span matListItemLine>{{ a[3] }}</span>
-        </mat-list-item>
-      }
-    </mat-list>
-  </mat-card>
+  </section>
+} @else if (!mobile()) {
+  <button mat-fab extended class="open-panel" (click)="panelOpen.set(true)">
+    <span class="fab-ico">{{ tool().icon }}</span>{{ tool().name }}
+  </button>
 }
 
+<!-- ============ mobile bottom bar ============ -->
+@if (mobile() && !panelOpen()) {
+  <div class="bottom-bar">
+    <button mat-flat-button class="tonal-btn" (click)="panelOpen.set(true)"><span class="fab-ico">{{ tool().icon }}</span>{{ tool().name }}</button>
+    <span class="spacer"></span>
+    <button mat-icon-button class="tonal" (click)="togglePlaces()" matTooltip="Places"><mat-icon>bookmarks</mat-icon></button>
+    <button mat-fab class="arm-fab" [class.armed]="armed()" (click)="toggleArmed()"><mat-icon>{{ armed() ? 'gps_fixed' : 'gps_not_fixed' }}</mat-icon></button>
+  </div>
+}
+
+<!-- ============ top-right status ============ -->
+<div class="topbar">
+  @if (armed() && mobile()) { <div class="pill hint-pill">{{ hint() }}</div> }
+  @if (stats().count && !mobile()) { <div class="pill" matTooltip="Blasts · area flattened (5 psi) · tallest cloud">{{ statLine() }}</div> }
+  @if (abducted()) { <div class="pill" matTooltip="People beamed up"><mat-icon>person_raised_hand</mat-icon>{{ abducted() }}</div> }
+</div>
+
 @if (status()) {
-  <mat-card class="status" appearance="raised"><mat-icon>info</mat-icon>{{ status() }}</mat-card>
+  <div class="pill status"><mat-icon>info</mat-icon>{{ status() }}</div>
 }
 
 <!-- ============ saved places ============ -->
-<div class="places">
-  @for (p of places(); track p.id) {
-    <mat-card class="place" appearance="raised" (click)="go(p)" [matTooltip]="'Teleport to ' + p.name">
-      <img mat-card-image [src]="p.thumb" alt="" />
-      <div class="pl-name">{{ p.name }}</div>
-      <button mat-icon-button class="del" (click)="remove(p, $event)" matTooltip="Delete"><mat-icon>close</mat-icon></button>
-    </mat-card>
+<div class="places" [class.open]="placesOpen()">
+  @if (!mobile()) {
+    <div class="places-head">
+      <button mat-button class="places-toggle" (click)="togglePlaces()">
+        <mat-icon>{{ placesOpen() ? 'expand_more' : 'expand_less' }}</mat-icon>Places ({{ places().length }})
+      </button>
+      <button mat-icon-button class="sm" [matMenuTriggerFor]="placesMenu" matTooltip="Import / export"><mat-icon>more_vert</mat-icon></button>
+    </div>
   }
-  @if (saving()) {
-    <mat-card class="save-form" appearance="raised">
-      <mat-form-field appearance="outline" subscriptSizing="dynamic">
-        <mat-label>Place name</mat-label>
-        <input #nm matInput (keydown.enter)="confirmSave(nm)" autofocus />
-      </mat-form-field>
-      <button mat-icon-button (click)="confirmSave(nm)" matTooltip="Save"><mat-icon>check</mat-icon></button>
-      <button mat-icon-button (click)="saving.set(false)" matTooltip="Cancel"><mat-icon>close</mat-icon></button>
-    </mat-card>
-  } @else {
-    <mat-card class="place add" appearance="outlined" (click)="saving.set(true)" matTooltip="Save the current view">
-      <mat-icon>add_location_alt</mat-icon>
-      <span>Save place</span>
-    </mat-card>
+  @if (placesOpen()) {
+    <div class="strip">
+      @if (mobile()) {
+        <button mat-icon-button class="sm" [matMenuTriggerFor]="placesMenu"><mat-icon>more_vert</mat-icon></button>
+      }
+      @for (p of places(); track p.id) {
+        <button type="button" class="place" (click)="go(p)" [matTooltip]="'Teleport to ' + p.name">
+          @if (p.thumb) { <img [src]="p.thumb" alt="" /> } @else { <mat-icon class="noimg">landscape</mat-icon> }
+          <span class="pl-name">{{ p.name }}</span>
+          <span class="del" (click)="remove(p, $event)" matTooltip="Delete"><mat-icon>close</mat-icon></span>
+        </button>
+      }
+      @if (saving()) {
+        <div class="save-form">
+          <input #nm type="text" placeholder="Place name" (keydown.enter)="confirmSave(nm)" autofocus />
+          <button mat-icon-button class="sm" (click)="confirmSave(nm)"><mat-icon>check</mat-icon></button>
+          <button mat-icon-button class="sm" (click)="saving.set(false)"><mat-icon>close</mat-icon></button>
+        </div>
+      } @else {
+        <button type="button" class="place add" (click)="saving.set(true)">
+          <mat-icon>add_location_alt</mat-icon><span>Save view</span>
+        </button>
+      }
+    </div>
   }
 </div>
+<mat-menu #placesMenu="matMenu">
+  <button mat-menu-item (click)="exportPlaces()" [disabled]="!places().length"><mat-icon>download</mat-icon>Export JSON</button>
+  <button mat-menu-item (click)="importPlaces()"><mat-icon>upload</mat-icon>Import JSON</button>
+</mat-menu>
 
 <!-- ============ info ============ -->
-<button mat-stroked-button class="info-btn" (click)="showInfo.set(!showInfo())"><mat-icon>info</mat-icon>Info & controls</button>
 @if (showInfo()) {
-  <mat-card class="info" appearance="raised">
-    @if (radii().length) {
-      <mat-card-header><mat-card-title>{{ tool().name }}</mat-card-title><mat-card-subtitle>Effect radii</mat-card-subtitle></mat-card-header>
-      <mat-list dense>
-        @for (r of radii(); track r[0]) {
-          <mat-list-item>
-            <span matListItemAvatar class="dot" [style.background]="r[2]"></span>
-            <span matListItemTitle>{{ r[0] }}</span>
-            <span matListItemMeta class="meta">{{ km(r[1]) }}</span>
-          </mat-list-item>
-        }
-      </mat-list>
-      <mat-divider />
+  <section class="info">
+    <header>
+      <span class="title">{{ radii().length ? tool().name : 'Info' }}</span>
+      <span class="spacer"></span>
+      <button mat-icon-button class="sm" (click)="showInfo.set(false)"><mat-icon>close</mat-icon></button>
+    </header>
+    @for (r of radii(); track r[0]) {
+      <div class="r"><span><i [style.background]="r[2]"></i>{{ r[0] }}</span><b>{{ km(r[1]) }}</b></div>
     }
-    <mat-card-content>
-      <h4>Controls</h4>
-      <p>Drag: pan · Wheel / right-drag: zoom<br />
-        Middle-drag or Shift+drag: rotate & tilt<br />
-        Ctrl+drag: look around · Double-click: zoom in<br />
-        <kbd>D</kbd> arm · <kbd>K</kbd> chain · <kbd>L</kbd> labels · <kbd>Esc</kbd> disarm<br />
-        <kbd>N</kbd> north up · <kbd>U</kbd> top-down · <kbd>R</kbd> reset view</p>
-      <mat-divider />
-      <p>Radii from Glasstone &amp; Dolan scaling laws (like NUKEMAP). Asteroids and weird stuff: numbers just for fun.</p>
-      <mat-divider />
-      <mat-form-field appearance="outline" subscriptSizing="dynamic" class="token">
-        <mat-label>Cesium ion token</mat-label>
-        <input #tk matInput [value]="token()" placeholder="paste and press Enter" (keydown.enter)="saveToken(tk.value)" />
-        <mat-hint>Free at ion.cesium.com — only if the map stops loading</mat-hint>
-      </mat-form-field>
-    </mat-card-content>
-  </mat-card>
+    <h4>Controls</h4>
+    <p>Drag pan · Wheel / right-drag zoom · Middle-drag or Shift+drag rotate &amp; tilt · Ctrl+drag look around · Double-click zoom in</p>
+    <p><kbd>D</kbd> arm · <kbd>M</kbd> launch mode · <kbd>K</kbd> chain · <kbd>L</kbd> labels · <kbd>Esc</kbd> disarm · <kbd>N</kbd> north · <kbd>U</kbd> top-down · <kbd>R</kbd> reset</p>
+    <p class="muted">Radii from Glasstone &amp; Dolan scaling (like NUKEMAP). Asteroids and weird stuff: numbers for fun.</p>
+    <label class="search token">
+      <mat-icon>key</mat-icon>
+      <input #tk type="text" [value]="token()" placeholder="Cesium ion token (only if the map stops loading)" (keydown.enter)="saveToken(tk.value)" />
+    </label>
+  </section>
 }
 
-<button mat-fab class="reset" (click)="reset()" matTooltip="Reset view: north up, top-down (R)" matTooltipPosition="left">
-  <svg viewBox="0 0 34 34" [style.transform]="'rotate(' + -heading() + 'deg)'"><path d="M17 3 L21.5 17 L12.5 17 Z" fill="#ff5f4a" /><path d="M17 31 L21.5 17 L12.5 17 Z" fill="currentColor" /></svg>
-</button>
+@if (!(mobile() && panelOpen())) {
+  <button mat-mini-fab class="reset" (click)="reset()" matTooltip="Reset view (R)" matTooltipPosition="left">
+    <svg viewBox="0 0 34 34" [style.transform]="'rotate(' + -heading() + 'deg)'"><path d="M17 3 L21.5 17 L12.5 17 Z" fill="#ff5f4a" /><path d="M17 31 L21.5 17 L12.5 17 Z" fill="currentColor" /></svg>
+  </button>
+}

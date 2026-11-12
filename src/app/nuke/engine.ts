@@ -225,7 +225,7 @@ export class NukeEngine {
 
   private needsFrames() {
     return this.blasts.some((D) => D.t < D.E.Trise * 3 || !D.heard) || this.flyers.length > 0 || this.particles.length > 0 ||
-      this.bombs.length > 0 || this.turrets.length > 0 || this.ufos.length > 0 || this.ducks.some((d) => !d.rest) ||
+      this.bombs.length > 0 || this.planes.length > 0 || this.turrets.length > 0 || this.ufos.length > 0 || this.ducks.some((d) => !d.rest) ||
       this.shake.amp > 0 || this.keys.size > 0 || this.recentering || this.FLASH > 0.001;
   }
   private poke() { this.scene?.requestRender(); }
@@ -259,31 +259,36 @@ export class NukeEngine {
 
   private MAX = 16;
   private setupShader() {
-    const U = Cesium.UniformType, uniforms = { u_tint: { type: U.VEC3, value: new Cesium.Cartesian3(1, 1, 1) } };
+    const U = Cesium.UniformType, uniforms = {};
     let calls = '';
     for (let i = 0; i < this.MAX; i++) {
       uniforms['u_c' + i] = { type: U.VEC3, value: new Cesium.Cartesian3() };
       uniforms['u_n' + i] = { type: U.VEC3, value: new Cesium.Cartesian3(0, 0, 1) };
       uniforms['u_a' + i] = { type: U.VEC4, value: new Cesium.Cartesian4() };
       uniforms['u_b' + i] = { type: U.VEC4, value: new Cesium.Cartesian4(0, 0, 0, 1) };
-      calls += `fx(p, u_c${i}, u_n${i}, u_a${i}, u_b${i}, material);\n`;
+      calls += `fx(p, u_c${i}, u_n${i}, u_a${i}, u_b${i}, tint, material);\n`;
     }
     this.bShader = new Cesium.CustomShader({
       uniforms,
       fragmentShaderText: `
-      void fx(vec3 p, vec3 c, vec3 up, vec4 a, vec4 b, inout czm_modelMaterial m) {
+      void fx(vec3 p, vec3 c, vec3 up, vec4 a, vec4 b, vec3 tint, inout czm_modelMaterial m) {
         if (a.y <= 0.0) return;
         vec3 d3 = p - c;
         float h = dot(d3, up);
         float d = length(d3 - up * h);
         float lim = min(a.x, a.z);
         float k = (1.0 - smoothstep(lim * 0.85, lim, d)) * mix(0.55, 0.9, 1.0 - smoothstep(a.y * 0.7, a.y * 1.2, d));
-        m.diffuse = mix(m.diffuse, vec3(0.1, 0.08, 0.065) * u_tint, k);
+        m.diffuse = mix(m.diffuse, vec3(0.1, 0.08, 0.065) * tint, k);
         m.diffuse += vec3(1.0, 0.55, 0.2) * b.z / (1.0 + pow(d / b.w, 2.0));
       }
       void fragmentMain(FragmentInput fsInput, inout czm_modelMaterial material) {
         vec3 p = fsInput.attributes.positionWC;
-        material.diffuse *= u_tint;
+        // per-pixel day/night: the sun lights half the globe, with a soft terminator and a warm golden band
+        float sd = dot(normalize(p), czm_sunDirectionWC);
+        float day = smoothstep(-0.10, 0.12, sd);
+        float golden = day * (1.0 - smoothstep(0.04, 0.38, sd));
+        vec3 tint = mix(vec3(0.09, 0.12, 0.21), vec3(1.0), day) * mix(vec3(1.0), vec3(1.14, 0.86, 0.66), golden);
+        material.diffuse *= tint;
         ${calls}
       }`,
     });
@@ -349,12 +354,23 @@ export class NukeEngine {
       const mode = e.button === 1 || (e.button === 0 && e.shiftKey) ? 'tilt' : e.button === 2 ? 'zoom' : null;
       if (!mode) return;
       const P = this.pickWorld(evPos(e)); if (!P) return;
-      this.drag = { mode, P, up: Cesium.Ellipsoid.WGS84.geodeticSurfaceNormal(P, new C3()), last: evPos(e) };
+      const d: any = { mode, P, up: Cesium.Ellipsoid.WGS84.geodeticSurfaceNormal(P, new C3()), last: evPos(e), start: evPos(e) };
+      if (mode === 'tilt') {
+        // freeze the orbit at drag start: everything below is computed from these, never accumulated
+        d.enu = Cesium.Transforms.eastNorthUpToFixedFrame(P);
+        const v = Cesium.Matrix4.multiplyByPoint(Cesium.Matrix4.inverseTransformation(d.enu, new Cesium.Matrix4()), camera.positionWC, new C3());
+        d.R = C3.magnitude(v);
+        d.el0 = Math.asin(Cesium.Math.clamp(v.z / d.R, -1, 1));
+        d.az0 = Math.hypot(v.x, v.y) > 1 ? Math.atan2(v.x, v.y) : camera.heading + Math.PI; // compass bearing P -> camera
+        d.h0 = camera.heading;
+        d.p0 = camera.pitch;
+      }
+      this.drag = d;
       try { cv.setPointerCapture(e.pointerId); } catch {}
     });
     on(cv, 'pointermove', (e) => {
       const p = evPos(e);
-      if (this.lineStart) this.mouseWorld = this.pickWorld(p);
+      if (this.armed && !this.drag) { this.hoverPx = p; this.poke(); }
       const d = this.drag; if (!d) return;
       const dx = p.x - d.last.x, dy = p.y - d.last.y; d.last = p;
       if (d.mode === 'zoom') {
@@ -363,14 +379,24 @@ export class NukeEngine {
         camera.move(C3.normalize(C3.subtract(d.P, camera.positionWC, new C3()), new C3()), dist - nd);
         return;
       }
-      if (dx) { const o = orbit(d.P, d.up, -dx * (2 * Math.PI / cv.clientWidth)); camera.setView({ destination: o.pos, orientation: { direction: o.dir, up: o.up } }); }
-      if (dy) {
-        const right = C3.normalize(C3.cross(camera.directionWC, d.up, new C3()), new C3());
-        const o = orbit(d.P, right, -dy * (Math.PI / cv.clientHeight));
-        const el = elevation(o.pos, d.P, d.up);
-        if (el > Cesium.Math.toRadians(3) && el < Cesium.Math.toRadians(89.5) && C3.dot(o.dir, d.up) < 0.02)
-          camera.setView({ destination: o.pos, orientation: { direction: o.dir, up: o.up } });
-      }
+      // Orbit around the point grabbed at drag start, from the TOTAL mouse offset (no accumulated error):
+      //   vertical   -> elevation of the camera above that point (tilt),
+      //   horizontal -> bearing around it (rotate).
+      // A small dead zone keeps a vertical drag from also rotating, and vice versa. Roll is always 0.
+      const dead = (v) => Math.sign(v) * Math.max(0, Math.abs(v) - 10);
+      const tx = dead(p.x - d.start.x), ty = dead(p.y - d.start.y);
+      const lo = Cesium.Math.toRadians(3), hi = Cesium.Math.toRadians(89.5);
+      const el = Cesium.Math.clamp(d.el0 + ty * (Math.PI / cv.clientHeight), lo, hi);
+      const az = d.az0 + tx * ((2 * Math.PI) / cv.clientWidth);
+      const pos = Cesium.Matrix4.multiplyByPoint(d.enu, new C3(d.R * Math.cos(el) * Math.sin(az), d.R * Math.cos(el) * Math.cos(az), d.R * Math.sin(el)), new C3());
+      camera.setView({
+        destination: pos,
+        orientation: {
+          heading: d.h0 + (az - d.az0),
+          pitch: Cesium.Math.clamp(d.p0 - (el - d.el0), -Cesium.Math.PI_OVER_TWO, -0.01),
+          roll: 0,
+        },
+      });
     });
     on(cv, 'pointerup', () => (this.drag = null));
     on(cv, 'pointercancel', () => (this.drag = null));
@@ -447,11 +473,10 @@ export class NukeEngine {
 
   // ======================================================================= public setters
   setTool(t: Tool) {
-    // the silo belongs to the ICBM tool only: leaving it removes the silo
-    if (t.kind !== 'icbm') this.removeBase();
+    // (the silo belongs to launch mode, not to a tool)
     this.tool = t; this.cancelLine(); this.updateHint();
   }
-  setArmed(v: boolean) { this.armed = v; this.cv.style.cursor = v ? 'crosshair' : ''; if (!v) { this.cancelLine(); this.removeBase(); } this.updateHint(); }
+  setArmed(v: boolean) { this.armed = v; this.cv.style.cursor = v ? 'crosshair' : ''; if (!v) { this.cancelLine(); this.hover = null; } this.updateHint(); }
   setChain(v: boolean) { this.chain = v; }
   setSound(v: boolean) { this.soundOn = v; if (v) this.audio(); }
   setRings(v: boolean) {
@@ -496,7 +521,8 @@ export class NukeEngine {
     this.flyers.forEach((f) => { this.rm(f.head); f.entity && this.viewer.entities.remove(f.entity); }); this.flyers = [];
     this.particles.forEach((p) => this.rm(p.b)); this.particles = [];
     this.ducks.forEach((d) => { d.model && this.scene.primitives.remove(d.model); d.bb && this.rm(d.bb); }); this.ducks = [];
-    this.turrets.forEach((t) => this.viewer.entities.remove(t.entity)); this.turrets = [];
+    this.turrets.forEach((t) => this.removeTurret(t)); this.turrets = [];
+    this.planes.forEach((P) => { this.removeShape(P.shape); this.rm(P.strobe); }); this.planes = [];
     this.bombs.forEach((b) => this.rm(b.b)); this.bombs = [];
     this.ufos.forEach((u) => this.removeUfo(u)); this.ufos = [];
     this.removeBase();
@@ -531,9 +557,9 @@ export class NukeEngine {
   private updateHint() {
     const k = this.tool.kind;
     if (!this.armed) return this.ev.hint('Press D or ARM, then click the map');
-    if (k === 'icbm') return this.ev.hint(this.base ? 'Click a target · Alt+click moves the silo' : 'Click where to place your silo');
-    if (k === 'railgun') return this.ev.hint(`Click to place a turret (${this.turrets.length}/4)`);
     if (k === 'carpet') return this.ev.hint(this.lineStart ? 'Click the end of the line' : 'Click the start of the bombing line');
+    if (this.launchMode) return this.ev.hint(this.base ? 'Click a target · Alt+click moves the silo' : 'Launch mode: click where to place your silo');
+    if (k === 'railgun') return this.ev.hint(`Click to place a turret (${this.turrets.length}/4)`);
     if (k === 'ufo') return this.ev.hint(`Click to summon a UFO (${this.ufos.length}/4)`);
     this.ev.hint('Click the map · Esc to disarm');
   }
@@ -542,18 +568,27 @@ export class NukeEngine {
     const w = this.tool;
     this.audio();
     this.poke();
+    if (w.kind === 'carpet') {
+      if (!this.lineStart) return this.startLine(p);
+      const a = this.lineStart; this.cancelLine(); this.updateHint();
+      return this.carpetBomb(a, p, w);
+    }
+    if (this.launchMode) {
+      if (!this.base || alt) return this.setBase(p);
+      if (w.kind === 'cruise') return this.fireCruise(p, w);
+      return this.launch(p, w);
+    }
+    return this.deliver(p, w);
+  }
+
+  /** what a payload does when it arrives at (or is dropped on) a point */
+  private deliver(p, w) {
     switch (w.kind) {
       case 'duck': return this.dropDuck(p);
       case 'ufo': return this.spawnUfo(p);
-      case 'asteroid': case 'rod': return this.fireFromSky(p, w);
-      case 'cruise': return this.fireCruise(p, w);
-      case 'icbm':
-        if (!this.base || alt) return this.setBase(p);
-        return this.fireIcbm(p, w);
+      case 'asteroid': case 'rod': return this.launchMode ? this.detonate(p, w) : this.fireFromSky(p, w);
+      case 'cruise': return this.launchMode ? this.smallBoom(p, 2.2) : this.fireCruise(p, w);
       case 'railgun': return this.placeTurret(p);
-      case 'carpet':
-        if (!this.lineStart) return this.startLine(p);
-        { const a = this.lineStart; this.cancelLine(); this.updateHint(); return this.carpetBomb(a, p, w); }
       default: return this.detonate(p, w);
     }
   }
@@ -641,20 +676,28 @@ export class NukeEngine {
 
   // ======================================================================= sun
   private updateSun() {
-    const c = Cesium.Cartographic.fromCartesian(this.camera.positionWC);
-    const lon = Cesium.Math.toDegrees(c.longitude), lat = c.latitude;
-    const d = new Date(); d.setUTCHours(0, 0, 0, 0);
-    this.viewer.clock.currentTime = Cesium.JulianDate.fromDate(new Date(d.getTime() + (this.sunHour - lon / 15) * 3600e3));
-    const doy = Math.floor((d.getTime() - Date.UTC(d.getUTCFullYear(), 0, 0)) / 864e5);
-    const decl = Cesium.Math.toRadians(-23.44 * Math.cos((2 * Math.PI / 365) * (doy + 10)));
-    const H = Cesium.Math.toRadians((this.sunHour - 12) * 15);
-    const sinEl = Math.sin(lat) * Math.sin(decl) + Math.cos(lat) * Math.cos(decl) * Math.cos(H);
-    const day = smooth(-0.12, 0.12, sinEl);
-    const golden = day * (1 - smooth(0.05, 0.4, sinEl));
-    const night = [0.11, 0.14, 0.24];
-    const t = [0, 1, 2].map((i) => lerp(night[i], 1, day) * lerp(1, [1.14, 0.86, 0.66][i], golden));
-    this.day = day; this.tint = t; this.golden = golden;
-    this.bShader.setUniform('u_tint', new Cesium.Cartesian3(t[0], t[1], t[2]));
+    // the slider is UTC time: the lit half of the globe depends on it alone, not on where you look
+    const view = this.camera.pickEllipsoid(new Cesium.Cartesian2(this.cv.clientWidth / 2, this.cv.clientHeight / 2)) || this.camera.positionWC;
+    if (this.sunHour !== this.sunHourSet) {
+      this.sunHourSet = this.sunHour;
+      const d = new Date(); d.setUTCHours(0, 0, 0, 0);
+      this.viewer.clock.currentTime = Cesium.JulianDate.fromDate(new Date(d.getTime() + this.sunHour * 3600e3));
+      const t = this.viewer.clock.currentTime, C3 = Cesium.Cartesian3;
+      const p = Cesium.Simon1994PlanetaryPositions.computeSunPositionInEarthInertialFrame(t, new C3());
+      const m = Cesium.Transforms.computeIcrfToFixedMatrix(t) || Cesium.Transforms.computeTemeToPseudoFixedMatrix(t);
+      this.sunDir = C3.normalize(Cesium.Matrix3.multiplyByVector(m, p, p), p);
+    }
+    this.tint = this.tintAt(view);
+  }
+  private sunDir = new Cesium.Cartesian3(1, 0, 0); private sunHourSet;
+  /** same day/night/golden-hour tint as the building shader, for a world position (smoke, particles) */
+  private tintAt(pos) {
+    const sd = Cesium.Cartesian3.dot(Cesium.Cartesian3.normalize(pos, new Cesium.Cartesian3()), this.sunDir);
+    const day = smooth(-0.1, 0.12, sd), golden = day * (1 - smooth(0.04, 0.38, sd));
+    const night = [0.09, 0.12, 0.21];
+    const t: any = [0, 1, 2].map((i) => lerp(night[i], 1, day) * lerp(1, [1.14, 0.86, 0.66][i], golden));
+    t.day = day;
+    return t;
   }
 
   // ======================================================================= blasts
@@ -743,8 +786,6 @@ export class NukeEngine {
     if (E.H > 8848) u('everest');
     if (E.H >= 99000) u('karman');
     if (['tsar', 'dino', 'rod'].includes(w.id)) u(w.id);
-    if (this.day < 0.2) u('night');
-    else if (this.golden > 0.5) u('sunset');
     if (this.blasts.length >= 6) u('six');
     if (s.area >= 1000) u('area');
     D.root.chainCount = (D.root.chainCount || 0) + 1;
@@ -757,7 +798,15 @@ export class NukeEngine {
     D.rings[key] = true;
     const pts = [];
     for (let i = 0; i <= 160; i++) { const a = (i / 160) * Math.PI * 2; pts.push(D.local(R * Math.cos(a), R * Math.sin(a), 0)); }
-    D.entities.push(this.viewer.entities.add({ show: this.showRings, polyline: { positions: pts, clampToGround: true, width: 2.5, material: Cesium.Color.fromCssColorString(color).withAlpha(0.9) } }));
+    D.entities.push(this.viewer.entities.add({ show: this.showRings, polyline: { positions: pts, clampToGround: true, width: 5, material: this.hiMat(color) } }));
+  }
+
+  /** High-contrast line material: bright colour with a black outline, readable on any map. */
+  private hiMat(color, dashed = false) {
+    const c = Cesium.Color.fromCssColorString(color);
+    return dashed
+      ? new Cesium.PolylineDashMaterialProperty({ color: c, gapColor: Cesium.Color.BLACK.withAlpha(0.85), dashLength: 16 })
+      : new Cesium.PolylineOutlineMaterialProperty({ color: c, outlineColor: Cesium.Color.BLACK, outlineWidth: 1.6 });
   }
 
   private geom(D, t) {
@@ -785,12 +834,12 @@ export class NukeEngine {
     else { const k = clamp01((f - 0.7) / 1.3); fc = [lerp(1, 0.55, k), lerp(0.55, 0.16, k), lerp(0.18, 0.06, k)]; }
     const sm = clamp01(t / (E.Trise * 0.35));
     const moon = [0.24, 0.27, 0.36];
-    const tn = this.tint.map((x, i) => Math.max(x, moon[i]));
+    D.tn = this.tintAt(D.groundPos); const tn = D.tn.map((x, i) => Math.max(x, moon[i]));
     const smoke = [lerp(0.62, 0.95, sm) * tn[0], lerp(0.42, 0.93, sm) * tn[1], lerp(0.30, 0.91, sm) * tn[2]];
     const capBot = G.zc - G.thick / 2;
     const camPos = this.camera.positionWC;
     const fadeIn = smooth(0, 0.03, t);
-    const night = 1 - this.day;
+    const night = 1 - D.tn.day;
     for (const p of D.puffs) {
       let x, y, z, size, shade = 1, heat = 0, alpha, base = smoke, under = 0;
       if (p.type === 'torus') {
@@ -859,7 +908,7 @@ export class NukeEngine {
     const t = D.t;
     if (D.shock < D.maxR * 1.2) D.shock += 340 * E.shockBoost * (1 + (2.5 * E.Rfb) / Math.max(D.shock, E.Rfb)) * dtSim;
     D.dtSim = dtSim;
-    const glow = Math.exp(-t / E.tglow), night = 1 - this.day;
+    const glow = Math.exp(-t / E.tglow), night = 1 - (D.tn ? D.tn.day : 1);
     D.flash = t < 0.04 ? 1 : 0.95 * Math.exp(-(t - 0.04) / (0.12 + 0.35 * E.tmax));
     D.warm = 0.6 * glow * (1 + night);
     D.burn = smooth(0, E.tmax, t); D.glowB = 1.6 * glow * (1 + 1.5 * night);
@@ -980,16 +1029,49 @@ export class NukeEngine {
     });
   }
 
-  // ---- missiles ----
+  // ---- 3D shapes (real scale, built from Cesium primitives; no external models) ----
+  /** parts: [{ geom: 'box'|'ellipsoid'|'cylinder', size: [x,y,z] | {length,top,bottom}, at: [x,y,z], color, alpha? }] */
+  private makeShape(parts) {
+    const VF = Cesium.PerInstanceColorAppearance.VERTEX_FORMAT;
+    return parts.map((p) => {
+      const geometry = p.geom === 'box' ? Cesium.BoxGeometry.fromDimensions({ dimensions: new Cesium.Cartesian3(...p.size), vertexFormat: VF })
+        : p.geom === 'ellipsoid' ? new Cesium.EllipsoidGeometry({ radii: new Cesium.Cartesian3(...p.size), vertexFormat: VF, stackPartitions: 16, slicePartitions: 24 })
+        : new Cesium.CylinderGeometry({ length: p.size.length, topRadius: p.size.top, bottomRadius: p.size.bottom, vertexFormat: VF, slices: 16 });
+      const color = Cesium.Color.fromCssColorString(p.color).withAlpha(p.alpha ?? 1);
+      const prim = this.scene.primitives.add(new Cesium.Primitive({
+        geometryInstances: new Cesium.GeometryInstance({ geometry, attributes: { color: Cesium.ColorGeometryInstanceAttribute.fromColor(color) } }),
+        appearance: new Cesium.PerInstanceColorAppearance({ translucent: color.alpha < 1, closed: true }),
+        asynchronous: false,
+      }));
+      return { prim, at: p.at || [0, 0, 0] };
+    });
+  }
+  /** place a shape: frame = local 4x4 (x forward, z up) in world coordinates */
+  private poseShape(shape, frame) {
+    for (const s of shape) s.prim.modelMatrix = Cesium.Matrix4.multiply(frame, Cesium.Matrix4.fromTranslation(new Cesium.Cartesian3(...s.at)), new Cesium.Matrix4());
+  }
+  private removeShape(shape) { shape.forEach((s) => this.scene.primitives.remove(s.prim)); }
+  private frameAt(pos, heading = 0) {
+    return Cesium.Transforms.headingPitchRollToFixedFrame(pos, new Cesium.HeadingPitchRoll(heading, 0, 0));
+  }
+
+  // ---- launch-from-silo mode: any payload can be delivered by a ballistic missile ----
+  launchMode = false;
+  setLaunchMode(on: boolean) {
+    this.launchMode = on;
+    if (!on) this.removeBase();
+    this.updateHint();
+    this.poke();
+  }
   private setBase(pos) {
     if (this.base) this.viewer.entities.remove(this.base.entity);
-    const gold = Cesium.Color.fromCssColorString('#ffcf4a');
+    const gold = Cesium.Color.fromCssColorString('#ffd23f');
     this.base = {
       pos: Cesium.Cartesian3.clone(pos),
       entity: this.viewer.entities.add({
         position: pos,
-        point: { pixelSize: 11, color: gold, outlineColor: Cesium.Color.BLACK, outlineWidth: 2, disableDepthTestDistance: Number.POSITIVE_INFINITY },
-        label: { text: 'BASE', font: '600 12px Roboto, system-ui', pixelOffset: new Cesium.Cartesian2(0, -18), fillColor: gold, outlineColor: Cesium.Color.BLACK, outlineWidth: 3, style: Cesium.LabelStyle.FILL_AND_OUTLINE, disableDepthTestDistance: Number.POSITIVE_INFINITY },
+        point: { pixelSize: 13, color: gold, outlineColor: Cesium.Color.BLACK, outlineWidth: 3, disableDepthTestDistance: Number.POSITIVE_INFINITY },
+        label: { text: 'SILO', font: '700 12px Roboto, system-ui', pixelOffset: new Cesium.Cartesian2(0, -20), fillColor: gold, outlineColor: Cesium.Color.BLACK, outlineWidth: 4, style: Cesium.LabelStyle.FILL_AND_OUTLINE, disableDepthTestDistance: Number.POSITIVE_INFINITY },
       }),
     };
     this.updateHint();
@@ -1000,25 +1082,33 @@ export class NukeEngine {
     const path = (s) => { const c = geo.interpolateUsingFraction(s); c.height = lerp(ca.height, cb.height, s) + heightFn(s, geo.surfaceDistance); return Cesium.Cartographic.toCartesian(c); };
     return { path, dist: geo.surfaceDistance };
   }
-  private fireIcbm(target, w) {
-    const { path, dist } = this.geoPath(this.base.pos, target, (s, d) => (Math.min(1200e3, d * 0.22) + 15e3) * 4 * s * (1 - s));
+  private ballistic(from, to) {
+    return this.geoPath(from, to, (s, d) => (Math.min(1200e3, d * 0.22) + Math.min(15e3, 2000 + d * 0.3)) * 4 * s * (1 - s));
+  }
+  /** fire whatever is selected from the silo; the payload is delivered on impact */
+  private launch(target, w) {
+    const { path, dist } = this.ballistic(this.base.pos, target);
     const pts = []; for (let i = 0; i <= 120; i++) pts.push(path(i / 120));
-    const entity = this.viewer.entities.add({ polyline: { positions: pts, width: 1.5, material: new Cesium.PolylineDashMaterialProperty({ color: Cesium.Color.fromCssColorString('#ffcf4a').withAlpha(0.6), dashLength: 18 }) } });
-    const dur = 3 + 5 * Math.min(1, dist / 9e6), vis = Math.max(250, Math.min(120000, dist * 0.012));
+    const entity = this.viewer.entities.add({ polyline: { positions: pts, width: 3, material: this.hiMat('#ffd23f', true), depthFailMaterial: this.hiMat('#ffd23f', true) } });
+    const dur = 2.5 + 5.5 * Math.min(1, dist / 9e6), vis = Math.max(120, Math.min(120000, dist * 0.012));
     this.whoosh(Math.min(2.5, dur), 1.2);
     this.launchFlyer({
-      path, dur, headPixels: 22, headColor: new Cesium.Color(1, 0.75, 0.4, 1), entity,
+      path, dur, headPixels: 20, headColor: new Cesium.Color(1, 0.75, 0.4, 1), entity,
       trail: { size: vis, life: 4, c0: [1, 0.85, 0.6], c1: [0.85, 0.85, 0.85], every: 0.025, a0: 0.55 },
-      onArrive: () => { this.detonate(target, w); if (dist >= 5.5e6) this.ev.unlock('icbm'); },
+      onArrive: () => { this.deliver(target, w); if (dist >= 5.5e6) this.ev.unlock('icbm'); },
     });
   }
-  /** No silo: it comes in low from behind the camera, 25 km out, and hugs the terrain to the target. */
+  /** cruise missile: without a silo it comes in low from behind the camera; with a silo it starts there */
   private fireCruise(target, w) {
     const C3 = Cesium.Cartesian3, enu = Cesium.Transforms.eastNorthUpToFixedFrame(target);
-    const hd = this.camera.heading + Math.PI + (Math.random() - 0.5) * 0.5, R = 25000;
-    const start = Cesium.Matrix4.multiplyByPoint(enu, new C3(Math.sin(hd) * R, Math.cos(hd) * R, 0), new C3());
-    const { path, dist } = this.geoPath(start, target, (s, d) => 300 * (1 - smooth(1 - Math.min(0.08, 2000 / d), 1, s)));
-    const dur = Cesium.Math.clamp(dist / 2500, 2, 12);
+    let start;
+    if (this.launchMode && this.base) start = this.base.pos;
+    else {
+      const hd = this.camera.heading + Math.PI + (Math.random() - 0.5) * 0.5, R = 25000;
+      start = Cesium.Matrix4.multiplyByPoint(enu, new C3(Math.sin(hd) * R, Math.cos(hd) * R, 0), new C3());
+    }
+    const { path, dist } = this.geoPath(start, target, (s, d) => 300 * smooth(0, Math.min(0.08, 2000 / d), s) * (1 - smooth(1 - Math.min(0.08, 2000 / d), 1, s)));
+    const dur = Cesium.Math.clamp(dist / 2500, 2, 14);
     this.whoosh(Math.min(2, dur), 1.6);
     this.launchFlyer({
       path, dur, headPixels: 12, headColor: new Cesium.Color(1, 0.85, 0.55, 1),
@@ -1029,12 +1119,22 @@ export class NukeEngine {
 
   // ---- railgun turrets ----
   private placeTurret(pos) {
-    if (this.turrets.length >= 4) { const old = this.turrets.shift(); this.viewer.entities.remove(old.entity); }
-    const entity = this.viewer.entities.add({ position: pos, billboard: { image: this.turretTex, width: 34, height: 34, disableDepthTestDistance: Number.POSITIVE_INFINITY } });
-    this.turrets.push({ pos: Cesium.Cartesian3.clone(pos), entity, cool: 0.6 });
+    if (this.turrets.length >= 4) this.removeTurret(this.turrets.shift());
+    const shape = this.makeShape([
+      { geom: 'cylinder', size: { length: 4, top: 5, bottom: 6 }, at: [0, 0, 2], color: '#3c434c' },
+      { geom: 'box', size: [7, 5, 3], at: [0, 0, 5.5], color: '#6b7682' },
+      { geom: 'box', size: [16, 0.8, 0.8], at: [8, -1.2, 6.2], color: '#2fd3e6' },
+      { geom: 'box', size: [16, 0.8, 0.8], at: [8, 1.2, 6.2], color: '#2fd3e6' },
+    ]);
+    const t = { pos: Cesium.Cartesian3.clone(pos), shape, cool: 0.6, aim: Math.random() * 6.28 };
+    this.poseShape(shape, this.frameAt(pos, t.aim));
+    const entity = this.viewer.entities.add({ position: pos, point: { pixelSize: 9, color: Cesium.Color.fromCssColorString('#2fd3e6'), outlineColor: Cesium.Color.BLACK, outlineWidth: 3, disableDepthTestDistance: Number.POSITIVE_INFINITY } });
+    (t as any).entity = entity;
+    this.turrets.push(t);
     this.ev.unlock('railgun');
     this.updateHint();
   }
+  private removeTurret(t) { this.removeShape(t.shape); this.viewer.entities.remove(t.entity); }
   private updateTurrets(dt) {
     const C3 = Cesium.Cartesian3;
     for (const t of this.turrets) {
@@ -1043,75 +1143,108 @@ export class NukeEngine {
       t.cool = 0.9 + Math.random() * 0.8;
       const enu = Cesium.Transforms.eastNorthUpToFixedFrame(t.pos);
       const a = Math.random() * Math.PI * 2, r = 3000 + Math.random() * 12000;
+      t.aim = Math.PI / 2 - a; // ENU angle -> heading frame (x forward)
+      this.poseShape(t.shape, this.frameAt(t.pos, t.aim - Math.PI / 2));
       const carto = Cesium.Cartographic.fromCartesian(Cesium.Matrix4.multiplyByPoint(enu, new C3(Math.cos(a) * r, Math.sin(a) * r, 0), new C3()));
       const target = this.groundAt(carto, Cesium.Cartographic.fromCartesian(t.pos).height);
-      const muzzle = Cesium.Matrix4.multiplyByPoint(enu, new C3(0, 0, 30), new C3());
-      this.spawn(muzzle, { glow: true, s0: 40, s1: 120, life: 0.2, c0: [0.7, 0.95, 1], c1: [0.4, 0.8, 1], a0: 1 });
+      const muzzle = Cesium.Matrix4.multiplyByPoint(enu, new C3(Math.cos(a) * 16, Math.sin(a) * 16, 6), new C3());
+      this.spawn(muzzle, { glow: true, s0: 20, s1: 70, life: 0.2, c0: [0.7, 0.95, 1], c1: [0.4, 0.8, 1], a0: 1 });
       this.zap();
       const { path } = this.geoPath(muzzle, target, (s, d) => d * 0.04 * 4 * s * (1 - s));
       this.launchFlyer({
         path, dur: 0.35 + r / 25000, headPixels: 9, headColor: new Cesium.Color(0.75, 0.97, 1, 1),
-        trail: { size: 60, life: 0.8, c0: [0.7, 0.95, 1], c1: [0.6, 0.75, 0.85], every: 0.008, a0: 0.6 },
+        trail: { size: 40, life: 0.8, c0: [0.7, 0.95, 1], c1: [0.6, 0.75, 0.85], every: 0.008, a0: 0.6 },
         onArrive: () => this.smallBoom(target, 1.6),
       });
     }
   }
 
-  // ---- carpet bombing ----
+  // ---- carpet bombing: three real-scale bombers; the longer the line, the higher they fly ----
+  private planes = [];
   private startLine(p) {
     this.lineStart = Cesium.Cartesian3.clone(p);
-    this.mouseWorld = Cesium.Cartesian3.clone(p);
+    this.hover = Cesium.Cartesian3.clone(p);
     this.rubber = this.viewer.entities.add({
       polyline: {
-        positions: new Cesium.CallbackProperty(() => [this.lineStart, this.mouseWorld || this.lineStart], false),
-        clampToGround: true, width: 3,
-        material: new Cesium.PolylineDashMaterialProperty({ color: Cesium.Color.fromCssColorString('#ffcf4a'), dashLength: 16 }),
+        positions: new Cesium.CallbackProperty(() => this.liftedLine(this.lineStart, this.hover || this.lineStart), false),
+        width: 4, material: this.hiMat('#ffd23f', true), depthFailMaterial: this.hiMat('#ffd23f', true),
       },
     });
     this.updateHint();
+  }
+  private liftedLine(a, b) {
+    const ca = Cesium.Cartographic.fromCartesian(a), cb = Cesium.Cartographic.fromCartesian(b);
+    const pts = [];
+    for (let i = 0; i <= 24; i++) { const f = i / 24; pts.push(Cesium.Cartesian3.fromRadians(lerp(ca.longitude, cb.longitude, f), lerp(ca.latitude, cb.latitude, f), lerp(ca.height, cb.height, f) + 4)); }
+    return pts;
   }
   private cancelLine() {
     if (this.rubber) this.viewer.entities.remove(this.rubber);
     this.rubber = null; this.lineStart = null;
   }
+  private makeBomber() {
+    return this.makeShape([
+      // dark charcoal reads far better than light grey over a bright, detailed city
+      { geom: 'ellipsoid', size: [24, 2.4, 2.6], at: [0, 0, 0], color: '#2c3238' },
+      { geom: 'box', size: [9, 56, 0.9], at: [1, 0, 0.4], color: '#22272c' },
+      { geom: 'box', size: [5, 18, 0.7], at: [-20, 0, 1.2], color: '#22272c' },
+      { geom: 'box', size: [6, 0.7, 8], at: [-20, 0, 4.5], color: '#1b1f23' },
+      { geom: 'cylinder', size: { length: 5, top: 1.1, bottom: 1.1 }, at: [3, -12, -1.6], color: '#59616b' },
+      { geom: 'cylinder', size: { length: 5, top: 1.1, bottom: 1.1 }, at: [3, 12, -1.6], color: '#59616b' },
+    ]);
+  }
   private carpetBomb(a, b, w) {
-    const C3 = Cesium.Cartesian3;
     const ca = Cesium.Cartographic.fromCartesian(a), cb = Cesium.Cartographic.fromCartesian(b);
     const geo = new Cesium.EllipsoidGeodesic(ca, cb), len = Math.max(200, geo.surfaceDistance);
-    const lead = 20000, alt = Math.max(ca.height, cb.height) + 2500, total = len + 2 * lead;
-    const at = (d, side) => {
+    const agl = Cesium.Math.clamp(len * 0.12, 120, 9000); // short run: low pass you can see; long run: high altitude
+    const alt = Math.max(ca.height, cb.height) + agl;
+    const lead = Math.max(2500, agl * 5), total = len + 2 * lead;
+    const fly = (d, side) => {
       const s = (d - lead) / len;
       const c = geo.interpolateUsingFraction(Math.max(-lead / len, Math.min(1 + lead / len, s)));
-      const pos = Cesium.Cartographic.toCartesian(new Cesium.Cartographic(c.longitude, c.latitude, alt));
-      if (!side) return pos;
-      const enu = Cesium.Transforms.eastNorthUpToFixedFrame(pos);
       const hd = geo.startHeading + (geo.endHeading - geo.startHeading) * clamp01(s);
-      return Cesium.Matrix4.multiplyByPoint(enu, new C3(Math.cos(hd) * side, -Math.sin(hd) * side, 0), new C3());
+      const center = Cesium.Cartographic.toCartesian(new Cesium.Cartographic(c.longitude, c.latitude, alt));
+      const enu = Cesium.Transforms.eastNorthUpToFixedFrame(center);
+      const pos = Cesium.Matrix4.multiplyByPoint(enu, new Cesium.Cartesian3(Math.cos(hd) * side, -Math.sin(hd) * side, 0), new Cesium.Cartesian3());
+      return { pos, hd };
     };
-    const speed = 700, dur = Cesium.Math.clamp(total / speed, 6, 22), spacing = Math.max(150, len / 30);
-    this.whoosh(Math.min(4, dur * 0.5), 0.5);
+    const speed = Cesium.Math.clamp(len / 6, 160, 900), dur = total / speed, spacing = Math.max(60, len / 30);
+    const sep = Math.max(90, Math.min(400, len * 0.03));
+    this.whoosh(Math.min(4, dur * 0.4), 0.5);
     this.ev.unlock('carpet');
-    [-260, 0, 260].forEach((side, j) => {
-      let nextDrop = lead + (j % 2) * spacing * 0.5;
-      const lastH = Cesium.Cartographic.fromCartesian(b).height;
-      this.launchFlyer({
-        path: (s) => at(s * total, side), dur, headPixels: 34, image: 'jet', orient: true, headColor: Cesium.Color.WHITE,
-        trail: { size: 60, life: 6, c0: [1, 1, 1], c1: [0.9, 0.9, 0.92], every: 0.035, a0: 0.45 },
-        onStep: (s, pos) => {
-          const d = s * total;
-          while (d >= nextDrop && nextDrop <= lead + len) {
-            const drop = at(nextDrop, side);
-            const g = Cesium.Cartographic.fromCartesian(drop);
-            this.dropBomb(drop, this.groundAt(new Cesium.Cartographic(g.longitude, g.latitude, 0), lastH), w);
-            nextDrop += spacing;
-          }
-        },
-      });
+    const lastH = cb.height;
+    [-sep, 0, sep].forEach((side, j) => {
+      const shape = this.makeBomber();
+      const strobe = this.bb(null, 'glow', { sizeInMeters: false, width: 16, height: 16, color: new Cesium.Color(1, 0.15, 0.15, 1), disableDepthTestDistance: 5000 });
+      this.planes.push({ shape, strobe, t: -j * 0.35, dur, total, fly, side, nextDrop: lead + (j % 2) * spacing * 0.5, lead, len, spacing, w, lastH, trailAcc: 0 });
     });
   }
+  private updatePlanes(dt) {
+    for (let i = this.planes.length - 1; i >= 0; i--) {
+      const P = this.planes[i];
+      P.t += dt;
+      const s = clamp01(P.t / P.dur), d = s * P.total;
+      const { pos, hd } = P.fly(d, P.side);
+      // heading from north (geodesic) -> Cesium HPR heading (x axis = forward)
+      this.poseShape(P.shape, this.frameAt(pos, hd - Math.PI / 2));
+      P.strobe.position = pos;
+      const on = Math.floor(P.t * 2.5) % 2 === 0;
+      P.strobe.color = on ? new Cesium.Color(1, 0.15, 0.15, 1) : new Cesium.Color(1, 1, 1, 0.9);
+      P.trailAcc += dt;
+      while (P.trailAcc > 0.05) { P.trailAcc -= 0.05; this.spawn(pos, { s0: 10, s1: 55, life: 7, c0: [1, 1, 1], c1: [0.95, 0.95, 0.97], a0: 0.7 }); }
+      while (d >= P.nextDrop && P.nextDrop <= P.lead + P.len) {
+        const drop = P.fly(P.nextDrop, P.side).pos;
+        const g = Cesium.Cartographic.fromCartesian(drop);
+        this.dropBomb(drop, this.groundAt(new Cesium.Cartographic(g.longitude, g.latitude, 0), P.lastH), P.w);
+        P.nextDrop += P.spacing;
+      }
+      if (s >= 1) { this.removeShape(P.shape); this.rm(P.strobe); this.planes.splice(i, 1); }
+    }
+  }
   private dropBomb(from, to, w) {
-    const b = this.bb(null, 'glow', { sizeInMeters: false, width: 5, height: 5, position: from, color: new Cesium.Color(0.15, 0.15, 0.15, 1) });
-    this.bombs.push({ b, from, to, t: 0, dur: 1.4 + Math.random() * 0.3, w });
+    const b = this.bb(null, 'glow', { sizeInMeters: false, width: 6, height: 6, position: from, color: new Cesium.Color(0.05, 0.05, 0.05, 1) });
+    const fall = Math.sqrt((2 * Math.max(50, Cesium.Cartesian3.distance(from, to))) / 9.81) * 0.5; // a bit faster than real
+    this.bombs.push({ b, from, to, t: 0, dur: Math.max(0.8, fall), w });
   }
   private updateBombs(dt) {
     for (let i = this.bombs.length - 1; i >= 0; i--) {
@@ -1122,63 +1255,79 @@ export class NukeEngine {
     }
   }
 
-  // ---- UFOs ----
+  // ---- UFOs: a real-size saucer (32 m) parks low over the target and beams people up ----
   private ufos = [];
   private abducted = 0;
   private spawnUfo(target) {
     if (this.ufos.length >= 4) this.removeUfo(this.ufos.shift());
-    const C3 = Cesium.Cartesian3, enu = Cesium.Transforms.eastNorthUpToFixedFrame(target);
-    const hover = 420, beamR = 110;
+    const enu = Cesium.Transforms.eastNorthUpToFixedFrame(target);
+    const hover = 110, beamR = 24;
     const a = Math.random() * Math.PI * 2;
+    const parts = [
+      { geom: 'ellipsoid', size: [16, 16, 2.6], at: [0, 0, 0], color: '#c3cad2' },
+      { geom: 'ellipsoid', size: [11, 11, 1.6], at: [0, 0, -1.4], color: '#5f6873' },
+      { geom: 'ellipsoid', size: [6, 6, 4.8], at: [0, 0, 2.2], color: '#7fe9ff', alpha: 0.75 },
+      { geom: 'ellipsoid', size: [5, 5, 0.6], at: [0, 0, -2.9], color: '#9dffb7' },
+    ];
+    for (let i = 0; i < 10; i++) {
+      const th = (i / 10) * Math.PI * 2;
+      parts.push({ geom: 'ellipsoid', size: [0.8, 0.8, 0.8], at: [Math.cos(th) * 15.6, Math.sin(th) * 15.6, -0.2], color: ['#ffe14d', '#59ff9a', '#ff5fd2'][i % 3] });
+    }
     const u: any = {
-      enu, hover, beamR, t: 0, arrive: 3.2, beam: null, glow: null, people: [], spawn: 0,
-      from: [Math.cos(a) * 9000, Math.sin(a) * 9000, 5500],
-      body: this.bb(null, 'ufo', { sizeInMeters: true, width: 170, height: 85, position: target }),
+      enu, target: Cesium.Cartesian3.clone(target), hover, beamR, t: 0, arrive: 3.2, beam: null, people: [], spawn: 0, spin: 0,
+      from: [Math.cos(a) * 6000, Math.sin(a) * 6000, 3500], shape: this.makeShape(parts),
+      marker: this.viewer.entities.add({ position: target, point: { pixelSize: 8, color: Cesium.Color.fromCssColorString('#59ff9a'), outlineColor: Cesium.Color.BLACK, outlineWidth: 3, disableDepthTestDistance: Number.POSITIVE_INFINITY } }),
     };
     this.ufos.push(u);
     this.theremin();
     this.updateHint();
   }
   private removeUfo(u) {
-    this.rm(u.body);
-    if (u.glow) this.rm(u.glow);
+    this.removeShape(u.shape);
     if (u.beam) this.viewer.entities.remove(u.beam);
-    u.people.forEach((p) => this.rm(p.b));
+    this.viewer.entities.remove(u.marker);
+    u.people.forEach((p) => this.removeShape(p.shape));
+  }
+  private makePerson() {
+    const shirt = ['#e53935', '#1e88e5', '#43a047', '#fdd835', '#8e24aa', '#fb8c00', '#eceff1'][Math.floor(Math.random() * 7)];
+    return this.makeShape([
+      { geom: 'cylinder', size: { length: 0.85, top: 0.12, bottom: 0.15 }, at: [0, 0, 0.42], color: '#37474f' },
+      { geom: 'cylinder', size: { length: 0.65, top: 0.22, bottom: 0.18 }, at: [0, 0, 1.15], color: shirt },
+      { geom: 'ellipsoid', size: [0.12, 0.12, 0.14], at: [0, 0, 1.63], color: '#f1c27d' },
+    ]);
   }
   private updateUfos(dt) {
     const C3 = Cesium.Cartesian3;
     for (const u of this.ufos) {
-      u.t += dt;
+      u.t += dt; u.spin += dt * 0.8;
       const s = smooth(0, u.arrive, u.t);
-      const bob = 7 * Math.sin(u.t * 1.6);
+      const bob = 1.5 * Math.sin(u.t * 1.6);
       const x = lerp(u.from[0], 0, s), y = lerp(u.from[1], 0, s), z = lerp(u.from[2], u.hover, s) + bob * s;
-      u.body.position = Cesium.Matrix4.multiplyByPoint(u.enu, new C3(x, y, z), new C3());
+      const pos = Cesium.Matrix4.multiplyByPoint(u.enu, new C3(x, y, z), new C3());
+      this.poseShape(u.shape, this.frameAt(pos, u.spin));
       if (u.t < u.arrive) continue;
       if (!u.beam) {
         u.beam = this.viewer.entities.add({
-          position: Cesium.Matrix4.multiplyByPoint(u.enu, new C3(0, 0, u.hover / 2 - 10), new C3()),
-          cylinder: { length: u.hover - 20, topRadius: 22, bottomRadius: u.beamR, material: Cesium.Color.fromCssColorString('#a8ffbf').withAlpha(0.17), outline: false },
+          position: Cesium.Matrix4.multiplyByPoint(u.enu, new C3(0, 0, (u.hover - 3) / 2), new C3()),
+          cylinder: { length: u.hover - 3, topRadius: 6, bottomRadius: u.beamR, material: Cesium.Color.fromCssColorString('#a8ffbf').withAlpha(0.2), outline: true, outlineColor: Cesium.Color.fromCssColorString('#59ff9a').withAlpha(0.6), numberOfVerticalLines: 12 },
         });
-        u.glow = this.bb(null, 'glow', { sizeInMeters: true, width: u.beamR * 2.6, height: u.beamR * 2.6, position: Cesium.Matrix4.multiplyByPoint(u.enu, new C3(0, 0, 3), new C3()), color: new Cesium.Color(0.6, 1, 0.7, 0.35) });
         this.ev.unlock('ufo');
       }
-      // a new person every so often, somewhere inside the beam
       u.spawn -= dt;
-      if (u.spawn <= 0) {
-        u.spawn = 0.18 + Math.random() * 0.25;
-        const r = Math.sqrt(Math.random()) * u.beamR * 0.9, th = Math.random() * Math.PI * 2;
-        u.people.push({ r, th, z: 0, v: 3, spin: (Math.random() < 0.5 ? -1 : 1) * (0.6 + Math.random() * 0.6), b: this.bb(null, 'person', { sizeInMeters: true, width: 9, height: 18, verticalOrigin: Cesium.VerticalOrigin.BOTTOM }) });
+      if (u.spawn <= 0 && u.people.length < 40) {
+        u.spawn = 0.35 + Math.random() * 0.4;
+        const r = Math.sqrt(Math.random()) * u.beamR * 0.85, th = Math.random() * Math.PI * 2;
+        u.people.push({ r, th, z: 0, v: 0.6, spin: (Math.random() < 0.5 ? -1 : 1) * (0.4 + Math.random() * 0.5), tumble: Math.random() * 6, shape: this.makePerson() });
       }
       for (let i = u.people.length - 1; i >= 0; i--) {
         const p = u.people[i];
-        p.v = Math.min(45, p.v + 6 * dt); // slow at first, then faster
-        p.z += p.v * dt;
-        p.th += p.spin * dt;
-        const k = p.z / u.hover, rr = p.r * (1 - 0.85 * k);
-        p.b.position = Cesium.Matrix4.multiplyByPoint(u.enu, new C3(rr * Math.cos(p.th), rr * Math.sin(p.th), p.z), new C3());
-        p.b.rotation = p.th * 0.7;
-        p.b.color = new Cesium.Color(1, 1, 1, 1 - smooth(0.85, 1, k));
-        if (p.z >= u.hover - 25) { this.rm(p.b); u.people.splice(i, 1); this.abducted++; this.ev.abducted(this.abducted); }
+        p.v = Math.min(9, p.v + 1.2 * dt); // slow lift-off, then steadier
+        p.z += p.v * dt; p.th += p.spin * dt; p.tumble += dt;
+        const k = p.z / u.hover, rr = p.r * (1 - 0.8 * k);
+        const ppos = Cesium.Matrix4.multiplyByPoint(u.enu, new C3(rr * Math.cos(p.th), rr * Math.sin(p.th), p.z), new C3());
+        const frame = Cesium.Transforms.headingPitchRollToFixedFrame(ppos, new Cesium.HeadingPitchRoll(p.th, Math.sin(p.tumble) * 0.6 * k, Math.cos(p.tumble * 0.8) * 0.8 * k));
+        this.poseShape(p.shape, frame);
+        if (p.z >= u.hover - 6) { this.removeShape(p.shape); u.people.splice(i, 1); this.abducted++; this.ev.abducted(this.abducted); }
       }
     }
   }
@@ -1190,6 +1339,68 @@ export class NukeEngine {
     vib.frequency.value = 6; vg.gain.value = 22; vib.connect(vg); vg.connect(o.frequency);
     o.connect(g); g.connect(this.master); this.env(g, t, 0.16, 0.25, 2.4);
     o.start(t); vib.start(t); o.stop(t + 2.8); vib.stop(t + 2.8);
+  }
+
+  // ---- armed cursor preview: where it will hit and how far it reaches ----
+  private hover = null;
+  private previewEnts = null;
+  private previewRadii() {
+    const w = this.tool;
+    if (['nuke', 'asteroid', 'rod'].includes(w.kind)) {
+      const E = effects(w.W, w.air, w.hob);
+      return [[E.r20, '#ff3b30'], [E.r5, '#ff9500'], [E.r1, '#4fc3ff']];
+    }
+    if (w.kind === 'cruise') return [[60, '#ff9500']];
+    if (w.kind === 'railgun') return [[15000, '#2fd3e6'], [3000, '#2fd3e6']];
+    if (w.kind === 'ufo') return [[24, '#59ff9a']];
+    if (w.kind === 'duck') return [[130, '#ffd23f']];
+    return [];
+  }
+  private ensurePreview() {
+    if (this.previewEnts) return;
+    const ring = (i) => this.viewer.entities.add({
+      show: false,
+      polyline: {
+        positions: new Cesium.CallbackProperty(() => this.ringAt(i), false),
+        width: 4,
+        material: new Cesium.PolylineOutlineMaterialProperty({ color: new Cesium.CallbackProperty(() => Cesium.Color.fromCssColorString((this.previewRadii()[i] || [0, '#fff'])[1]), false), outlineColor: Cesium.Color.BLACK, outlineWidth: 1.6 }),
+        depthFailMaterial: new Cesium.PolylineOutlineMaterialProperty({ color: Cesium.Color.WHITE.withAlpha(0.55), outlineColor: Cesium.Color.BLACK.withAlpha(0.55), outlineWidth: 1 }),
+      },
+    });
+    this.previewEnts = {
+      rings: [ring(0), ring(1), ring(2)],
+      dot: this.viewer.entities.add({ show: false, position: new Cesium.CallbackProperty(() => this.hover, false), point: { pixelSize: 10, color: Cesium.Color.fromCssColorString('#ffd23f'), outlineColor: Cesium.Color.BLACK, outlineWidth: 3, disableDepthTestDistance: Number.POSITIVE_INFINITY } }),
+      arc: this.viewer.entities.add({
+        show: false,
+        polyline: { positions: new Cesium.CallbackProperty(() => this.arcPreview(), false), width: 3, material: this.hiMat('#ffd23f', true), depthFailMaterial: this.hiMat('#ffd23f', true) },
+      }),
+    };
+  }
+  private ringAt(i) {
+    const r = this.previewRadii()[i];
+    if (!r || !this.hover) return [];
+    const R = r[0], c = Cesium.Cartographic.fromCartesian(this.hover);
+    const enu = Cesium.Transforms.eastNorthUpToFixedFrame(this.hover), pts = [];
+    for (let k = 0; k <= 96; k++) {
+      const a = (k / 96) * Math.PI * 2;
+      const g = Cesium.Cartographic.fromCartesian(Cesium.Matrix4.multiplyByPoint(enu, new Cesium.Cartesian3(Math.cos(a) * R, Math.sin(a) * R, 0), new Cesium.Cartesian3()));
+      pts.push(Cesium.Cartesian3.fromRadians(g.longitude, g.latitude, c.height + 4));
+    }
+    return pts;
+  }
+  private arcPreview() {
+    if (!this.base || !this.hover) return [];
+    const { path } = this.ballistic(this.base.pos, this.hover);
+    const pts = []; for (let i = 0; i <= 60; i++) pts.push(path(i / 60));
+    return pts;
+  }
+  private updatePreview() {
+    this.ensurePreview();
+    const on = this.armed && !!this.hover && !this.drag;
+    const radii = this.previewRadii();
+    this.previewEnts.rings.forEach((e, i) => (e.show = on && i < radii.length));
+    this.previewEnts.dot.show = on;
+    this.previewEnts.arc.show = on && this.launchMode && !!this.base && this.tool.kind !== 'carpet';
   }
 
   // ---- rubber duck ----
@@ -1278,7 +1489,9 @@ export class NukeEngine {
     if (Math.abs(hd - this.lastHeading) > 0.5) { this.lastHeading = hd; this.ev.heading(hd); }
     this.noDepth(this.puffs); Object.values(this.cols).forEach((c) => this.noDepth(c));
 
-    this.updateFlyers(dt); this.updateBombs(dt); this.updateParticles(dt); this.updateDucks(dt); this.updateTurrets(dt); this.updateUfos(dt);
+    this.updateFlyers(dt); this.updateBombs(dt); this.updateParticles(dt); this.updateDucks(dt); this.updateTurrets(dt); this.updateUfos(dt); this.updatePlanes(dt);
+    if (this.hoverPx && this.armed) { const h = this.pickWorld(this.hoverPx); if (h) this.hover = h; this.hoverPx = null; }
+    this.updatePreview();
 
     // every cloud of every blast goes into ONE collection, sorted far → near, so overlapping clouds blend correctly
     const items = [];

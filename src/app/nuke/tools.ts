@@ -30,10 +30,9 @@ export const TOOLS: Tool[] = [
     { id: 'tsar', name: 'Tsar Bomba', icon: '👑', kind: 'nuke', W: 50000, air: true, desc: 'The most powerful explosion ever, 1961.' },
   ]),
   ...t('Missiles & guns', [
-    { id: 'icbm', name: 'ICBM', icon: '🚀', kind: 'icbm', W: 300, air: true, desc: 'Click to place your silo, then click targets anywhere on Earth. W87 warhead.' },
-    { id: 'cruise', name: 'Cruise missile', icon: '🛩️', kind: 'cruise', W: 0.00045, air: false, desc: 'Comes in low from behind you and hits the target. Conventional warhead.' },
-    { id: 'railgun', name: 'Railgun turret', icon: '⚡', kind: 'railgun', W: 0.003, air: false, desc: 'Place up to 4 turrets: they fire Mach 7 slugs on their own within 15 km.' },
-    { id: 'carpet', name: 'Carpet bombing', icon: '✈️', kind: 'carpet', W: 0.0003, air: false, desc: 'Click start and end of a line: three bombers lay bombs along it.' },
+    { id: 'cruise', name: 'Cruise missile', icon: '🛩️', kind: 'cruise', W: 0.00045, air: false, desc: 'Comes in low from behind you (or from your silo in launch mode). Conventional warhead.' },
+    { id: 'railgun', name: 'Railgun', icon: '⚡', kind: 'railgun', W: 0.003, air: false, desc: 'Place up to 4 turrets: they fire Mach 7 slugs on their own within 15 km.' },
+    { id: 'carpet', name: 'Carpet bomb', icon: '✈️', kind: 'carpet', W: 0.0003, air: false, desc: 'Click start and end of a line: three bombers lay bombs along it.' },
   ]),
   ...t('From space', [
     { id: 'rod', name: 'Rod from God', icon: '🛰️', kind: 'rod', W: 0.012, air: false, desc: 'A tungsten rod dropped from orbit.' },
