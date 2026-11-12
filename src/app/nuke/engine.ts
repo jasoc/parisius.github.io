@@ -163,6 +163,19 @@ function makePersonTex() {
 // r=2.5; craters over 5 km get a flat floor and a central peak. Low air bursts press a shallow dish instead.
 // ---------------------------------------------------------------------------
 const craterDepth = (R) => Math.min(0.4 * R, 30000);
+/**
+ * Damage is deliberately exaggerated over the weapon physics (effects(), rings and clouds stay true to them):
+ * a crater for every blast (2.5x for ground bursts; air bursts too unless they go off very high), everything
+ * inside 5 psi pancaked, partial collapse out to 80 % of the 1 psi radius.
+ */
+function damageOf(E) {
+  const X: any = { ...E };
+  X.crater = E.air ? 0.8 * E.Rfb * (1 - smooth(1.5 * E.Rfb, 6 * E.Rfb, E.hob)) : 2.5 * E.crater;
+  X.r20 = E.r5;
+  X.r5 = Math.min(CAP, 0.8 * E.r1);
+  X.r1 = Math.max(E.r1, 1.1 * X.r5);
+  return X;
+}
 function dishDepth(E) { return E.crater > 0 || E.hob >= E.Rfb ? 0 : Math.min(6, 0.01 * E.Rfb) * (1 - E.hob / E.Rfb); }
 function craterZ(d, E, crv) {
   if (!(crv > 0)) return 0;
@@ -412,7 +425,7 @@ export class NukeEngine {
     return this.blasts.some((D) => D.t < D.E.Trise * 3 || !D.heard) || this.flyers.length > 0 || this.particles.length > 0 || this.chunks.length > 0 ||
       this.bombs.length > 0 || this.planes.length > 0 || this.turrets.length > 0 || this.ufos.length > 0 || this.ducks.some((d) => !d.rest) ||
       this.shake.amp > 0 || this.keys.size > 0 || this.recentering || this.zoomPending !== 0 || this.FLASH > 0.001 ||
-      this.jobs.length > 0 || this.atlasDirty || this.mapDirty || this.blasts.some((D) => D.heat > 0) || (this.armed && this.hoverRest && !this.hoverRest.done);
+      this.jobs.length > 0 || this.atlasDirty || this.mapDirty || this.gusts.length > 0 || this.blasts.some((D) => D.heat > 0) || (this.armed && this.hoverRest && !this.hoverRest.done);
   }
   private poke() { this.scene?.requestRender(); }
 
@@ -447,7 +460,7 @@ export class NukeEngine {
   padGen = 1;
   /** how far a blast can move geometry: { reach (m from ground zero), down (m), side (m) }; see installCullPad */
   private padOf(D) {
-    const E = D.E, R = E.crater, Dp = Math.min(0.4 * R, 30000), dish = dishDepth(E);
+    const E = D.X, R = E.crater, Dp = Math.min(0.4 * R, 30000), dish = dishDepth(E);
     const p = R > 0 ? { reach: 2.5 * R, down: Dp * 1.1, side: 0.15 * Dp + 5 } : { reach: E.Rfb, down: dish, side: 0 };
     if (D.hm) { p.reach = Math.max(p.reach, E.r5); p.side = Math.max(p.side, 40); } // leaning blocks
     return p;
@@ -492,7 +505,7 @@ export class NukeEngine {
     let z = 0;
     for (const D of this.blasts) {
       const l = Cesium.Matrix4.multiplyByPoint(D.invEnu, P, this._sc || (this._sc = new Cesium.Cartesian3()));
-      z += craterZ(Math.hypot(l.x, l.y), D.E, D.crv);
+      z += craterZ(Math.hypot(l.x, l.y), D.X, D.crv);
     }
     if (this.maxStress > 6) z -= this.subsAt(Cesium.Cartographic.fromCartesian(P));
     return Math.max(z, -60000);
@@ -505,7 +518,7 @@ export class NukeEngine {
     // inside a collapsed zone the roofs are gone: smooth mirror of the shader (no per-block dice)
     for (const D of this.blasts) {
       if (!D.hm) continue;
-      const E = D.E, l = Cesium.Matrix4.multiplyByPoint(D.invEnu, P, new Cesium.Cartesian3()), d = Math.hypot(l.x, l.y);
+      const E = D.X, l = Cesium.Matrix4.multiplyByPoint(D.invEnu, P, new Cesium.Cartesian3()), d = Math.hypot(l.x, l.y);
       if (d > E.r5 || d > D.hmS) continue;
       const g = this.hmAt(D, l.x, l.y) + D.h0 + 3, above = h - g;
       if (above <= 0 || above > 400) continue;
@@ -525,7 +538,7 @@ export class NukeEngine {
   }
   /** a blast's lasting footprint: stress +1 inside r20 fading to 0 at r1, scorch, crater depth; area-weighted per texel */
   private splat(D) {
-    const E = D.E, MW = this.MW, MH = this.MH, Re = 6371000;
+    const E = D.X, MW = this.MW, MH = this.MH, Re = 6371000;
     const c = Cesium.Cartographic.fromCartesian(D.origin), lat0 = c.latitude, lon0 = c.longitude, R = E.crater, Dp = craterDepth(R);
     const reach = E.r1 / Re, dLon = Math.min(Math.PI, reach / Math.max(Math.cos(lat0), 0.02));
     const j0 = Math.max(0, Math.floor(((lat0 - reach) / Math.PI + 0.5) * MH)), j1 = Math.min(MH - 1, Math.floor(((lat0 + reach) / Math.PI + 0.5) * MH));
@@ -607,7 +620,7 @@ export class NukeEngine {
    * is PREPARED ahead when possible: while the armed cursor rests, when a missile is fired, for chain-reaction sites.
    */
   private preps = [];
-  private hmSize(E) { return Math.min(30000, Math.max(300, 1.1 * E.r5)); }
+  private hmSize(E) { return Math.min(30000, Math.max(300, 1.1 * damageOf(E).r5)); }
   prepHeightmap(origin, S) {
     if (!this.tileset) return null;
     const C3 = Cesium.Cartesian3, N = 64;
@@ -1306,6 +1319,7 @@ export class NukeEngine {
     if (this.launchMode) return this.ev.hint(this.base ? 'Click a target · Alt+click moves the silo' : 'Launch mode: click where to place your silo');
     if (k === 'railgun') return this.ev.hint(`Click to place a turret (${this.turrets.length}/4)`);
     if (k === 'ufo') return this.ev.hint(`Click to summon a UFO (${this.ufos.length}/4)`);
+    if (k === 'wind') return this.ev.hint('Click where the wind should blow · Esc to disarm');
     this.ev.hint('Click the map · Esc to disarm');
   }
 
@@ -1313,6 +1327,7 @@ export class NukeEngine {
     const w = this.tool;
     this.audio();
     this.poke();
+    if (w.kind === 'wind') return this.blowWind(p);
     if (w.kind === 'carpet') {
       if (!this.lineStart) return this.startLine(p);
       const a = this.lineStart; this.cancelLine(); this.updateHint();
@@ -1449,9 +1464,9 @@ export class NukeEngine {
   private setSlot(slot, D) {
     const s = this.bShader;
     s.setUniform('u_m' + slot, D ? Cesium.Matrix4.multiply(D.invEnu, this.camera.inverseViewMatrix, new Cesium.Matrix4()) : new Cesium.Matrix4());
-    s.setUniform('u_a' + slot, D ? new Cesium.Cartesian4(D.shock, D.E.r20, D.E.r5, D.E.r1) : new Cesium.Cartesian4());
+    s.setUniform('u_a' + slot, D ? new Cesium.Cartesian4(D.shock, D.X.r20, D.X.r5, D.X.r1) : new Cesium.Cartesian4());
     s.setUniform('u_b' + slot, D ? new Cesium.Cartesian4(D.E.rth, D.burn, D.glowB, D.E.Rfb * 3 + D.E.hob) : new Cesium.Cartesian4(0, 0, 0, 1));
-    s.setUniform('u_d' + slot, D ? new Cesium.Cartesian4(D.E.crater, D.crv, D.heat, D.seed) : new Cesium.Cartesian4());
+    s.setUniform('u_d' + slot, D ? new Cesium.Cartesian4(D.X.crater, D.crv, D.heat, D.seed) : new Cesium.Cartesian4());
     s.setUniform('u_e' + slot, D ? new Cesium.Cartesian4(D.hm ? D.slot : -1, D.hmS || 0, D.cshock, D.E.hob) : new Cesium.Cartesian4(-1, 0, 0, 0));
   }
   /** an old blast gives up its animation layers; the scar (crater, rubble, cracks, heightmap) stays */
@@ -1474,7 +1489,7 @@ export class NukeEngine {
     const k = this.cv.clientHeight / (2 * Math.tan((cam.frustum.fovy || 1) / 2));
     // (a Tsar "animates" for ~13 real minutes: plain animating-first would starve every old crater in view)
     const score = (D) => {
-      const r = D.E.r1, dc = C3.distance(cam.positionWC, D.groundPos);
+      const r = D.X.r1, dc = C3.distance(cam.positionWC, D.groundPos);
       if ((r / Math.max(dc - r, 1)) * k < 2) return Infinity;
       let sc = Math.max(0, C3.distance(look, D.groundPos) - r) / r;
       if (this.animating(D)) sc = sc * 0.3 - (D.t < D.E.Trise ? 2 : 1); // still blasting: wins unless far off
@@ -1519,6 +1534,7 @@ export class NukeEngine {
     const C3 = Cesium.Cartesian3;
     const groundPos = C3.clone(picked);
     const E = effects(w.W, w.air, w.hob);
+    if (opts.mini) E.Trise = 12; // a conventional hit: no cloud to raise, done animating fast
     // every blast stays as a permanent scar until clear(); the 16 shader slots are handed out each frame (schedule)
     const slot = -1;
     const enu = Cesium.Transforms.eastNorthUpToFixedFrame(groundPos);
@@ -1527,7 +1543,7 @@ export class NukeEngine {
     const D: any = {
       E, w, slot, id: ++this.blastId, groundPos, enu, local, cloudA: 1, t: 0, real: 0, shock: 0, burn: 0, glowB: 0, entities: [], rings: {},
       up: Cesium.Ellipsoid.WGS84.geodeticSurfaceNormal(groundPos, new C3()),
-      puffs: this.makePuffs(E, gen ? 0.55 : 1), heard: false, gen, children: [],
+      puffs: opts.mini ? [] : this.makePuffs(E, gen ? 0.55 : 1), heard: !!opts.mini, gen, children: [], mini: !!opts.mini,
     };
     D.root = opts.root || D;
     // The shader evaluates every blast from the ORIGINAL surface, but pickPosition sees the deformed one:
@@ -1535,7 +1551,7 @@ export class NukeEngine {
     const sunk = this.deformAt(groundPos);
     D.origin = C3.add(groundPos, C3.multiplyByScalar(D.up, -sunk, new C3()), new C3());
     D.invEnu = Cesium.Matrix4.inverseTransformation(Cesium.Transforms.eastNorthUpToFixedFrame(D.origin), new Cesium.Matrix4());
-    D.crv = 0; D.heat = 1; D.seed = Math.random() * 97; D.cshock = 0;
+    D.crv = 0; D.heat = 1; D.seed = Math.random() * 97; D.cshock = 0; D.X = damageOf(E);
     D.maxR = E.r1 * 1.15;
     // the ground decal is only needed on the globe fallback: on the 3D tiles the tile shader draws all of it
     if (!this.tileset) D.groundMat = new Cesium.Material({
@@ -1567,10 +1583,11 @@ export class NukeEngine {
     }));
     this.blasts.push(D); this.padGen++;
     // only the newest 16 keep their animation layers (clouds, rings, globe decal), like the old 16-blast cap did
-    const old = this.blasts[this.blasts.length - 1 - this.MAX];
+    const big = this.blasts.filter((b) => !b.mini), old = opts.mini ? null : big[big.length - 1 - this.MAX]; // minis never push a nuke's cloud out
     if (old) this.retire(old);
     this.startHeightmap(D);
     this.schedule(true);
+    if (opts.mini) return D;
 
     if (this.chain && gen < 2) {
       for (let i = 0, n = gen === 0 ? 3 : 2; i < n; i++)
@@ -1639,6 +1656,14 @@ export class NukeEngine {
     const capBot = G.zc - G.thick / 2;
     const camPos = this.camera.positionWC;
     const fadeIn = smooth(0, 0.03, t);
+    // wind: every gust in this blast's local frame (centre, horizontal direction, speed now, radius)
+    const dtR = this.dtReal, now = performance.now() / 1000;
+    const gl = this.gusts.length ? this.gusts.map((g) => {
+      const pl = Cesium.Matrix4.multiplyByPoint(D.invEnu, g.P, new Cesium.Cartesian3()), dl = Cesium.Matrix4.multiplyByPointAsVector(D.invEnu, g.dir, new Cesium.Cartesian3());
+      const h = Math.hypot(dl.x, dl.y) || 1;
+      return { x: pl.x, y: pl.y, dx: dl.x / h, dy: dl.y / h, U: g.U * g.env, R: g.R };
+    }) : null;
+    const nItems = items.length;
     const night = 1 - D.tn.day;
     for (const p of D.puffs) {
       let x, y, z, size, shade = 1, heat = 0, alpha, base = smoke, under = 0;
@@ -1697,6 +1722,25 @@ export class NukeEngine {
         size = dH * 1.8 + dR * 0.15; shade = 0.9; base = [0.78 * tn[0], 0.7 * tn[1], 0.62 * tn[2]];
         alpha = 0.2 * (1 - smooth(E.Trise * 0.4, E.Trise * 1.1, t));
       }
+      if (gl && dtR) {
+        let vx = 0, vy = 0;
+        const qx = x + (p.wx || 0), qy = y + (p.wy || 0);
+        // power-law wind profile: the cap runs ahead of the stem, so the mushroom shears over before it goes
+        const shear = Math.pow(Math.max(z, 50) / Math.max(0.5 * E.H, 500), 0.25);
+        for (const g of gl) { const f = 1 - smooth(0.6 * g.R, 1.5 * g.R, Math.hypot(qx - g.x, qy - g.y)); if (f > 0) { vx += g.dx * g.U * f * shear; vy += g.dy * g.U * f * shear; } }
+        const sp = Math.hypot(vx, vy);
+        if (sp > 0) {
+          // turbulence: eddies across the flow, different for every puff, and a little lift
+          const tw = 0.3 * sp * Math.sin(now * 0.9 + p.th * 7 + p.r2 * 13);
+          p.wx = (p.wx || 0) + (vx - (vy / sp) * tw) * dtR; p.wy = (p.wy || 0) + (vy + (vx / sp) * tw) * dtR;
+          p.wz = (p.wz || 0) + 0.05 * sp * (p.r3 - 0.4) * dtR;
+          // turbulent diffusion: the puff grows with the distance it travels (see below: and thins)
+          p.ws = (p.ws || 0) + (0.6 * sp * dtR) / Math.max(size, 50);
+          D.blown = true;
+        }
+      }
+      if (p.wx) { x += p.wx; y += p.wy; z += p.wz || 0; }
+      if (p.ws) { size *= 1 + p.ws; alpha /= (1 + p.ws) * (1 + p.ws); } // same smoke over a larger area
       alpha *= D.cloudA;
       if (size < 0.5 || alpha <= 0.005) continue;
       const pos = D.local(x, y, z, new Cesium.Cartesian3());
@@ -1706,6 +1750,41 @@ export class NukeEngine {
         r: Math.min(1, (lerp(base[0] * shade, fc[0], k) + o) * v), g: Math.min(1, (lerp(base[1] * shade, fc[1], k) + o * 0.45) * v), b: Math.min(1, (lerp(base[2] * shade, fc[2], k) + o * 0.12) * v),
       });
     }
+    if (D.blown && items.length === nItems) D.puffs = []; // blown away and spread to nothing: the cloud is gone
+  }
+
+  // ---- wind: gusts from the viewer toward the clicked point, over everything in view ----
+  private gusts = []; private dtReal = 0;
+  private blowWind(P) {
+    const C3 = Cesium.Cartesian3, cam = this.camera, n = Cesium.Ellipsoid.WGS84.geodeticSurfaceNormal(P, new C3());
+    const flat = (v) => C3.subtract(v, C3.multiplyByScalar(n, C3.dot(v, n), new C3()), v);
+    let d = flat(C3.subtract(P, cam.positionWC, new C3()));
+    if (C3.magnitude(d) < 1e-3 * C3.distance(P, cam.positionWC)) d = flat(C3.clone(cam.upWC)); // looking straight down: blow "up" the screen
+    C3.normalize(d, d);
+    const R = Cesium.Math.clamp(0.8 * C3.distance(cam.positionWC, P), 2000, 600000);
+    // cartoon-strong (clears a mushroom in a few seconds), but shaped like wind: shear, eddies, diffusion
+    this.gusts.push({ P: C3.clone(P), dir: d, R, U: R / 2.5, t: 0, dur: 5, env: 0 });
+    this.whoosh(1.8, 0.5);
+    const enu = Cesium.Transforms.eastNorthUpToFixedFrame(P);
+    for (let i = 0; i < 16; i++) { // dust riding the gust, so it can be seen
+      const a = Math.random() * 6.283, r = 0.45 * R * Math.sqrt(Math.random());
+      const pos = Cesium.Matrix4.multiplyByPoint(enu, new C3(r * Math.cos(a), r * Math.sin(a), 0.02 * R + Math.random() * 0.12 * R), new C3());
+      this.spawn(pos, { s0: 0.03 * R, s1: 0.09 * R, life: 2.5 + Math.random() * 1.5, c0: [0.82, 0.8, 0.76], c1: [0.8, 0.79, 0.77], a0: 0.22, vel: C3.multiplyByScalar(d, 0.15 * R, new C3()) });
+    }
+  }
+  private updateGusts(dt) {
+    this.dtReal = dt;
+    for (const g of this.gusts) { g.t += dt; g.env = smooth(0, 0.4, g.t) * (1 - smooth(g.dur - 1.5, g.dur, g.t)); }
+    this.gusts = this.gusts.filter((g) => g.t < g.dur);
+  }
+  /** wind velocity (world vector, m/s) at a world point, or null */
+  private windAt(X) {
+    const C3 = Cesium.Cartesian3; let v = null;
+    for (const g of this.gusts) {
+      const f = 1 - smooth(0.6 * g.R, 1.5 * g.R, C3.distance(X, g.P)); if (f <= 0) continue;
+      v = C3.add(v || new C3(), C3.multiplyByScalar(g.dir, g.U * g.env * f, new C3()), v || new C3());
+    }
+    return v;
   }
 
   private updateBlast(D, dt) {
@@ -1718,25 +1797,28 @@ export class NukeEngine {
     const shock0 = D.shock;
     if (D.shock < D.maxR * 1.2) D.shock += 340 * E.shockBoost * (1 + (2.5 * E.Rfb) / Math.max(D.shock, E.Rfb)) * dtSim;
     // collapse follows the front, but needs the bare-earth heightmap: if that lands late, it catches up in ~1.5 s
-    if (D.hm) D.cshock = Math.min(D.shock, D.cshock + Math.max(D.shock - shock0, (E.r5 / 1.5) * dt));
+    if (D.hm) D.cshock = Math.min(D.shock, D.cshock + Math.max(D.shock - shock0, (D.X.r5 / 1.5) * dt));
     D.dtSim = dtSim;
     this.spawnChunks(D);
     const glow = Math.exp(-t / E.tglow), night = 1 - (D.tn ? D.tn.day : 1);
     D.flash = t < 0.04 ? 1 : 0.95 * Math.exp(-(t - 0.04) / (0.12 + 0.35 * E.tmax));
     D.warm = 0.6 * glow * (1 + night);
+    if (D.mini) D.flash = D.warm = 0; // smallBoom draws its own flash
     D.burn = smooth(0, E.tmax, t); D.glowB = 1.6 * glow * (1 + 1.5 * night);
     D.crv = smooth(E.tmax * 0.5, E.tmax * 3 + 1, t);
     // glowing crater floor and cracks: cools in REAL time (sim time runs up to 12x faster), black after ~a minute
     const heat = Math.min(1, smooth(0, 1.5, D.real) * 1.2) * Math.exp(-D.real / 20); D.heat = D.real > 2 && heat < 0.01 ? 0 : heat;
     // retired blasts fade their cloud out, then drop it
     if (!D.splatted && (D.shock >= E.r1 || !this.animating(D))) { D.splatted = true; if (this.tileset) this.splat(D); }
+    // what a gust left of a cloud (blown far off, thinned) fades once the wind drops, then is freed
+    if (D.blown && !this.gusts.length && D.puffs.length) { D.cloudA = Math.max(0, D.cloudA - dt / 2); if (!D.cloudA) D.puffs = []; }
     if (D.retired && D.puffs.length) { D.cloudA = Math.max(0, D.cloudA - dt / 8); if (!D.cloudA) D.puffs = []; }
     if (D.groundMat) { const u = D.groundMat.uniforms; u.shock = D.shock / D.maxR; u.glow = Math.min(0.9, 1.2 * glow); u.burn = smooth(0, E.tmax * 2, t); u.crv = D.crv; }
-    this.addRing(D, 'fb', E.Rfb, '#ffd84a');
-    if (t > E.tmax) { this.addRing(D, 'rad', E.rrad, '#55dd66'); this.addRing(D, 'th', E.rth, '#ffb84d'); }
-    if (D.shock > E.r20) this.addRing(D, 'p20', E.r20, '#ff3030');
-    if (D.shock > E.r5) this.addRing(D, 'p5', E.r5, '#ff8a2a');
-    if (D.shock > E.r1) this.addRing(D, 'p1', E.r1, '#7fb2ff');
+    if (!D.mini) this.addRing(D, 'fb', E.Rfb, '#ffd84a');
+    if (D.mini) {} else if (t > E.tmax) { this.addRing(D, 'rad', E.rrad, '#55dd66'); this.addRing(D, 'th', E.rth, '#ffb84d'); }
+    if (!D.mini && D.shock > E.r20) this.addRing(D, 'p20', E.r20, '#ff3030');
+    if (!D.mini && D.shock > E.r5) this.addRing(D, 'p5', E.r5, '#ff8a2a');
+    if (!D.mini && D.shock > E.r1) this.addRing(D, 'p1', E.r1, '#7fb2ff');
 
     if (!D.heard) {
       const dist = Cesium.Cartesian3.distance(this.camera.positionWC, D.local(0, 0, E.hob));
@@ -1768,6 +1850,7 @@ export class NukeEngine {
       const f = p.age / p.life;
       if (f >= 1) { this.rm(p.b); this.particles.splice(i, 1); continue; }
       if (p.vel) { Cesium.Cartesian3.add(p.pos, Cesium.Cartesian3.multiplyByScalar(p.vel, dt, new Cesium.Cartesian3()), p.pos); p.b.position = p.pos; }
+      if (this.gusts.length) { const v = this.windAt(p.pos); if (v) { Cesium.Cartesian3.add(p.pos, Cesium.Cartesian3.multiplyByScalar(v, dt, v), p.pos); p.b.position = p.pos; } }
       p.b.width = p.b.height = lerp(p.s0, p.s1, Math.sqrt(f));
       const dk = p.lit ? [1, 1, 1] : tn;
       const cf = p.lit ? f : 1 - Math.pow(1 - f, 4); // fire colour fades to smoke quickly
@@ -1778,7 +1861,7 @@ export class NukeEngine {
   /** chunks thrown outward and up from the band the collapse front just crossed, near the camera only */
   private spawnChunks(D) {
     if (!this.tileset || !D.hm || D.retired) return;
-    const E = D.E, C3 = Cesium.Cartesian3, r0 = Math.max(D.chunkR || 0, 0.3 * E.Rfb), r1 = Math.min(D.cshock, E.r5);
+    const E = D.X, C3 = Cesium.Cartesian3, r0 = Math.max(D.chunkR || 0, 0.3 * E.Rfb), r1 = Math.min(D.cshock, E.r5);
     if (r1 <= r0) return;
     D.chunkR = r1;
     const cam = this.camera.positionWC, dc = C3.distance(cam, D.groundPos);
@@ -1868,6 +1951,9 @@ export class NukeEngine {
       this.spawn(Cesium.Matrix4.multiplyByPoint(enu, new C3(Math.cos(a) * 25 * scale, Math.sin(a) * 25 * scale, 5), new C3()), { s0: 20 * scale, s1: 80 * scale, life: 3, c0: [0.7, 0.62, 0.52], c1: [0.6, 0.55, 0.5], a0: 0.4 });
     }
     this.smallBoomSound(pos);
+    // conventional weapons damage the ground too: a small permanent scar (crater, rubble, cracks, debris), sized
+    // like a tens-of-tonnes blast (cruise ~30 m crater, collapse out to ~330 m), no cloud, rings or flash
+    if (this.tileset) this.detonate(pos, { id: 'mini', kind: 'mini', W: 0.0039 * (scale / 2.2) ** 3, air: false }, { mini: true });
     const dist = C3.distance(this.camera.positionWC, pos);
     if (dist < 2000 * scale) this.addShake(0.001 * scale * (1 - dist / (2000 * scale)));
   }
@@ -2377,7 +2463,7 @@ export class NukeEngine {
     if (Math.abs(hd - this.lastHeading) > 0.5) { this.lastHeading = hd; this.ev.heading(hd); }
     this.noDepth(this.puffs); Object.values(this.cols).forEach((c) => this.noDepth(c));
 
-    this.updateFlyers(dt); this.updateBombs(dt); this.updateParticles(dt); this.updateChunks(dt); this.updateDucks(dt); this.updateTurrets(dt); this.updateUfos(dt); this.updatePlanes(dt);
+    this.updateGusts(dt); this.updateFlyers(dt); this.updateBombs(dt); this.updateParticles(dt); this.updateChunks(dt); this.updateDucks(dt); this.updateTurrets(dt); this.updateUfos(dt); this.updatePlanes(dt);
     if (this.hoverPx && this.armed) { const h = this.pickWorld(this.hoverPx); if (h) this.hover = h; this.hoverPx = null; }
     // the cursor rests on a target: start its bare-earth heightmap now, the click will likely land there
     if (this.armed && this.hover && this.tileset && !this.launchMode && !this.lineStart) {

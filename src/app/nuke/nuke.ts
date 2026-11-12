@@ -60,6 +60,7 @@ export class Nuke {
     switch (t.kind) {
       case 'duck': return 'rubber · squeak';
       case 'ufo': return 'tractor beam';
+      case 'wind': return 'gust · clears the clouds';
       case 'railgun': return `${fmtW(t.W)}/shot · auto`;
       case 'carpet': return `${fmtW(t.W)} bombs · 3 bombers`;
       case 'cruise': return `${fmtW(t.W)} · conventional`;

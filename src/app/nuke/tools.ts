@@ -1,4 +1,4 @@
-export type ToolKind = 'nuke' | 'asteroid' | 'rod' | 'duck' | 'icbm' | 'cruise' | 'railgun' | 'carpet' | 'ufo';
+export type ToolKind = 'nuke' | 'asteroid' | 'rod' | 'duck' | 'icbm' | 'cruise' | 'railgun' | 'carpet' | 'ufo' | 'wind' | 'mini';
 
 export interface Tool {
   id: string;
@@ -44,6 +44,7 @@ export const TOOLS: Tool[] = [
   ...t('Weird', [
     { id: 'ufo', name: 'UFO', icon: '🛸', kind: 'ufo', W: 0, air: false, desc: 'A saucer parks over the target and slowly beams people up.' },
     { id: 'duck', name: 'Giant duck', icon: '🦆', kind: 'duck', W: 0, air: false, desc: '250 m of yellow rubber. Squeak.' },
+    { id: 'wind', name: 'Wind', icon: '🌬️', kind: 'wind', W: 0, air: false, desc: 'Click to blow the mushroom clouds away: a gust blows toward where you point, over all you can see.' },
   ]),
 ];
 
