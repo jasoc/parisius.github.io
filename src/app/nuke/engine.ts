@@ -145,6 +145,22 @@ function makePersonTex() {
 }
 
 // ---------------------------------------------------------------------------
+// Tile culling vs. vertex displacement: Cesium culls tiles with their ORIGINAL bounding boxes, so a tile sunk
+// into a crater vanishes as soon as its old box leaves the view (camera inside the pit looking down).
+// We wrap Cesium3DTile.updateVisibility (private API, checked on 1.146) and stretch each tile's box over the
+// space its geometry can be displaced into. Recomputed only when the deformation set changes (padGen).
+// ---------------------------------------------------------------------------
+let padEngine = null;
+function installCullPad(ts, engine) {
+  padEngine = engine;
+  const P = Object.getPrototypeOf(ts.root);
+  if (P.__nukePad || typeof P.updateVisibility !== 'function' || !Cesium.TileOrientedBoundingBox) return;
+  P.__nukePad = true;
+  const orig = P.updateVisibility;
+  P.updateVisibility = function (fs) { padEngine?.padTile(this); return orig.apply(this, arguments); };
+}
+
+// ---------------------------------------------------------------------------
 // The engine
 // ---------------------------------------------------------------------------
 export class NukeEngine {
@@ -243,6 +259,7 @@ export class NukeEngine {
       if (this.viewer.isDestroyed()) return;
       ts.enableCollision = true;
       ts.customShader = this.bShader;
+      installCullPad(ts, this);
       this.scene.primitives.add(ts);
       this.scene.globe.show = false;
       this.tileset = ts;
@@ -257,32 +274,82 @@ export class NukeEngine {
     }
   }
 
+  padGen = 1;
+  /** how far a blast can move geometry: { reach (m from ground zero), down (m), side (m) }; see installCullPad */
+  private padOf(D) { const s = this.spike || 0; return { reach: 650, down: s, side: 0 }; }
+  private spike = 0;
+  setSpike(m) { this.spike = m; this.bShader.setUniform('u_spike', m); this.padGen++; this.poke(); }
+  padTile(tile) {
+    if (tile.__pg === this.padGen) return;
+    tile.__pg = this.padGen;
+    const C3 = Cesium.Cartesian3, M3 = Cesium.Matrix3;
+    for (const key of ['_boundingVolume', '_contentBoundingVolume']) {
+      const v = tile[key];
+      if (!(v instanceof Cesium.TileOrientedBoundingBox)) continue;
+      const o = v.__o || (v.__o = Cesium.OrientedBoundingBox.clone(v.boundingVolume));
+      const t = new C3(), r = o.halfAxes, sph = Cesium.BoundingSphere.fromOrientedBoundingBox(o);
+      let side = 0, any = false;
+      for (const D of this.blasts) {
+        const p = this.padOf(D); if (!p.down && !p.side) continue;
+        if (C3.distance(sph.center, D.groundPos) > p.reach + sph.radius) continue;
+        C3.add(t, C3.multiplyByScalar(D.up, -p.down, new C3()), t); side = Math.max(side, p.side); any = true;
+      }
+      if (!any && !v.__padded) continue;
+      // box ∪ (box + t), grown by `side`: centre moves by t/2, each half axis grows by |t·axis|/2 + side
+      const half = new M3();
+      for (let i = 0; i < 3; i++) {
+        const a = M3.getColumn(r, i, new C3()), L = C3.magnitude(a) || 1, n = C3.divideByScalar(a, L, new C3());
+        M3.setColumn(half, i, C3.multiplyByScalar(n, L + Math.abs(C3.dot(t, n)) / 2 + side, new C3()), half);
+      }
+      v.update(C3.add(o.center, C3.multiplyByScalar(t, 0.5, new C3()), new C3()), half);
+      v.__padded = any;
+    }
+  }
+
   private MAX = 16;
   private setupShader() {
     const U = Cesium.UniformType, uniforms = {};
-    let calls = '';
+    let calls = '', vcalls = '';
     for (let i = 0; i < this.MAX; i++) {
-      uniforms['u_c' + i] = { type: U.VEC3, value: new Cesium.Cartesian3() };
-      uniforms['u_n' + i] = { type: U.VEC3, value: new Cesium.Cartesian3(0, 0, 1) };
+      // u_m = inverse(blast ENU) * inverse(view), built in doubles every frame: eye coords -> blast-local metres,
+      // precise near the blast (float32 world coords are only good to ~0.5 m)
+      uniforms['u_m' + i] = { type: U.MAT4, value: new Cesium.Matrix4() };
       uniforms['u_a' + i] = { type: U.VEC4, value: new Cesium.Cartesian4() };
       uniforms['u_b' + i] = { type: U.VEC4, value: new Cesium.Cartesian4(0, 0, 0, 1) };
-      calls += `fx(p, u_c${i}, u_n${i}, u_a${i}, u_b${i}, tint, material);\n`;
+      calls += `fx(pEC, u_m${i}, u_a${i}, u_b${i}, tint, material);\n`;
+      vcalls += `dEC += vfx(pEC, u_m${i}, u_a${i});\n`;
     }
+    uniforms.u_spike = { type: U.FLOAT, value: 0 };
     this.bShader = new Cesium.CustomShader({
       uniforms,
+      vertexShaderText: `
+      // displacement of one blast, in eye coordinates (summed over blasts, then taken back to model space)
+      vec3 vfx(vec3 pEC, mat4 M, vec4 a) {
+        if (a.y <= 0.0 || u_spike <= 0.0) return vec3(0.0);
+        vec3 l = (M * vec4(pEC, 1.0)).xyz;
+        float d = length(l.xy);
+        if (d > 600.0) return vec3(0.0);
+        vec3 v = vec3(0.0, 0.0, -u_spike * (1.0 - smoothstep(400.0, 500.0, d)));
+        return transpose(mat3(M)) * v;
+      }
+      void vertexMain(VertexInput vsInput, inout czm_modelVertexOutput vsOutput) {
+        vec3 pEC = (czm_modelView * vec4(vsOutput.positionMC, 1.0)).xyz;
+        vec3 dEC = vec3(0.0);
+        ${vcalls}
+        vsOutput.positionMC += mat3(czm_inverseModelView) * dEC;
+      }`,
       fragmentShaderText: `
-      void fx(vec3 p, vec3 c, vec3 up, vec4 a, vec4 b, vec3 tint, inout czm_modelMaterial m) {
+      void fx(vec3 pEC, mat4 M, vec4 a, vec4 b, vec3 tint, inout czm_modelMaterial m) {
         if (a.y <= 0.0) return;
-        vec3 d3 = p - c;
-        float h = dot(d3, up);
-        float d = length(d3 - up * h);
+        vec3 l = (M * vec4(pEC, 1.0)).xyz;
+        float d = length(l.xy);
         float lim = min(a.x, a.z);
         float k = (1.0 - smoothstep(lim * 0.85, lim, d)) * mix(0.55, 0.9, 1.0 - smoothstep(a.y * 0.7, a.y * 1.2, d));
         m.diffuse = mix(m.diffuse, vec3(0.1, 0.08, 0.065) * tint, k);
         m.diffuse += vec3(1.0, 0.55, 0.2) * b.z / (1.0 + pow(d / b.w, 2.0));
       }
       void fragmentMain(FragmentInput fsInput, inout czm_modelMaterial material) {
-        vec3 p = fsInput.attributes.positionWC;
+        vec3 p = fsInput.attributes.positionWC, pEC = fsInput.attributes.positionEC;
         // per-pixel day/night: the sun lights half the globe, with a soft terminator and a warm golden band
         float sd = dot(normalize(p), czm_sunDirectionWC);
         float day = smoothstep(-0.10, 0.12, sd);
@@ -752,8 +819,7 @@ export class NukeEngine {
   // ======================================================================= blasts
   private setSlot(slot, D) {
     const s = this.bShader;
-    s.setUniform('u_c' + slot, D ? D.groundPos : new Cesium.Cartesian3());
-    s.setUniform('u_n' + slot, D ? D.up : new Cesium.Cartesian3(0, 0, 1));
+    s.setUniform('u_m' + slot, D ? Cesium.Matrix4.multiply(D.invEnu, this.camera.inverseViewMatrix, new Cesium.Matrix4()) : new Cesium.Matrix4());
     s.setUniform('u_a' + slot, D ? new Cesium.Cartesian4(D.shock, D.E.r20, D.E.r5, D.E.r1) : new Cesium.Cartesian4());
     s.setUniform('u_b' + slot, D ? new Cesium.Cartesian4(D.E.rth, D.burn, D.glowB, D.E.Rfb * 3 + D.E.hob) : new Cesium.Cartesian4(0, 0, 0, 1));
   }
@@ -761,7 +827,7 @@ export class NukeEngine {
     this.scene.primitives.remove(D.ground);
     D.entities.forEach((e) => this.viewer.entities.remove(e));
     this.setSlot(D.slot, null);
-    this.blasts = this.blasts.filter((b) => b !== D);
+    this.blasts = this.blasts.filter((b) => b !== D); this.padGen++;
   }
   private makePuffs(E, scale) {
     const P = [], R = Math.random, n = (k) => Math.max(8, Math.round(k * scale));
@@ -791,6 +857,7 @@ export class NukeEngine {
       puffs: this.makePuffs(E, gen ? 0.55 : 1), heard: false, gen, children: [],
     };
     D.root = opts.root || D;
+    D.invEnu = Cesium.Matrix4.inverseTransformation(enu, new Cesium.Matrix4());
     D.maxR = E.r1 * 1.15;
     D.groundMat = new Cesium.Material({
       fabric: {
@@ -819,7 +886,7 @@ export class NukeEngine {
       appearance: new Cesium.MaterialAppearance({ material: D.groundMat, translucent: true, flat: true }),
       asynchronous: false,
     }));
-    this.blasts.push(D);
+    this.blasts.push(D); this.padGen++;
     this.setSlot(slot, D);
 
     if (this.chain && gen < 2) {
