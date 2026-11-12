@@ -210,6 +210,27 @@ const GLSL_COMMON = `
     float lump = 0.12 * Dp * n * (1.0 - smoothstep(1.3, 2.5, r)) * smoothstep(0.0, 0.5, r + big);
     return (bowl + rim + ej + peak + lump) * crv;
   }
+  // global damage map (equirectangular, ~20 km texels): r scorch, g cumulative stress (32 per unit), b crater depth (log)
+  vec2 lonLat(vec3 pEC) { vec3 w = (czm_inverseView * vec4(pEC, 1.0)).xyz; return vec2(atan(w.y, w.x), asin(clamp(w.z / length(w), -1.0, 1.0))); }
+  // cubic B-spline from 4 bilinear taps: a Tsar's scorch is ~1 texel wide, bilinear would draw it as a square
+  vec4 dmgAt(vec2 ll) {
+    vec2 sz = vec2(2048.0, 1024.0), uv = vec2(ll.x / 6.2831853 + 0.5, ll.y / 3.1415927 + 0.5) * sz - 0.5;
+    vec2 i = floor(uv), f = uv - i, f2 = f * f, f3 = f2 * f;
+    vec2 w0 = (1.0 - 3.0 * f + 3.0 * f2 - f3) / 6.0, w1 = (4.0 - 6.0 * f2 + 3.0 * f3) / 6.0, w2 = (1.0 + 3.0 * f + 3.0 * f2 - 3.0 * f3) / 6.0, w3 = f3 / 6.0;
+    vec2 g0 = w0 + w1, g1 = w2 + w3, h0 = (i - 0.5 + w1 / g0) / sz, h1 = (i + 1.5 + w3 / g1) / sz;
+    return g0.y * (g0.x * texture(u_map, vec2(h0.x, h0.y)) + g1.x * texture(u_map, vec2(h1.x, h0.y)))
+         + g1.y * (g0.x * texture(u_map, vec2(h0.x, h1.y)) + g1.x * texture(u_map, vec2(h1.x, h1.y)));
+  }
+  // metres on a plane tangent-ish to the globe: good to ~1 m, plenty for >= 100 m crack cells and 20 km fissures
+  vec2 globeXY(vec2 ll) { return vec2(ll.x * cos(ll.y), ll.y) * 6371000.0; }
+  // ground sinks where stress > 6, km deep, carved by ridged noise into fissures (>= 20 km wavelength)
+  float subsidence(float st, vec2 g) {
+    if (st <= 6.0) return 0.0;
+    // long wavelengths only: coarse and fine LOD tiles meet with few shared vertices, shorter ones open seams
+    float r1 = 1.0 - abs(2.0 * vn(g / 30000.0) - 1.0), r2 = 1.0 - abs(2.0 * vn(g / 60000.0 + 7.7) - 1.0);
+    float ridge = pow(max(r1, 0.8 * r2), 3.0);
+    return 5000.0 * smoothstep(6.0, 8.0, st) * mix(0.3, 1.8, ridge);
+  }
   // distance (cell units) to the nearest Voronoi cell border (F2-F1 style, exact border distance)
   float vorEdge(vec2 x) {
     vec2 n = floor(x), f = fract(x), mr = vec2(0.0), mg = vec2(0.0);
@@ -309,7 +330,7 @@ export class NukeEngine {
   labelsOn = false;
   sunHour = 14;
 
-  private blasts = []; private nextSlot = 0;
+  private blasts = []; private blastId = 0; private slots = new Array(16).fill(null);
   private bShader; private puffs; private puffPool = []; private cols; private particles = []; private flyers = [];
   private ducks = []; private turrets = []; private bombs = [];
   private base = null; private lineStart = null; private rubber = null; private mouseWorld = null;
@@ -376,7 +397,7 @@ export class NukeEngine {
     return this.blasts.some((D) => D.t < D.E.Trise * 3 || !D.heard) || this.flyers.length > 0 || this.particles.length > 0 ||
       this.bombs.length > 0 || this.planes.length > 0 || this.turrets.length > 0 || this.ufos.length > 0 || this.ducks.some((d) => !d.rest) ||
       this.shake.amp > 0 || this.keys.size > 0 || this.recentering || this.zoomPending !== 0 || this.FLASH > 0.001 ||
-      this.jobs.length > 0 || this.atlasDirty || this.blasts.some((D) => D.heat > 0) || (this.armed && this.hoverRest && !this.hoverRest.done);
+      this.jobs.length > 0 || this.atlasDirty || this.mapDirty || this.blasts.some((D) => D.heat > 0) || (this.armed && this.hoverRest && !this.hoverRest.done);
   }
   private poke() { this.scene?.requestRender(); }
 
@@ -431,6 +452,13 @@ export class NukeEngine {
         if (C3.distance(sph.center, D.groundPos) > p.reach + sph.radius) continue;
         C3.add(t, C3.multiplyByScalar(D.up, -p.down, new C3()), t); side = Math.max(side, p.side); any = true;
       }
+      if (this.maxStress > 6) { // sunk continents: worst case of the fissure noise, at the centre and around it
+        const cc = Cesium.Cartographic.fromCartesian(sph.center), up = cc && Cesium.Ellipsoid.WGS84.geodeticSurfaceNormal(sph.center, new C3());
+        // (huge tiles, e.g. the root, centred near the Earth's centre: assume the worst)
+        let st = !cc || sph.radius > 1e6 ? this.maxStress : this.stressAt(cc);
+        if (cc && sph.radius > 15000 && sph.radius <= 1e6) { const dd = sph.radius / 6371000; for (const [a, b] of [[dd, 0], [-dd, 0], [0, dd], [0, -dd]]) st = Math.max(st, this.stressAt(new Cesium.Cartographic(cc.longitude + b / Math.max(Math.cos(cc.latitude), 0.05), cc.latitude + a))); }
+        if (st > 6) { if (cc && up) C3.add(t, C3.multiplyByScalar(up, -5000 * smooth(6, 8, st) * 1.8, new C3()), t); else side = Math.max(side, 9000); any = true; }
+      }
       if (!any && !v.__padded) continue;
       // box ∪ (box + t), grown by `side`: centre moves by t/2, each half axis grows by |t·axis|/2 + side
       const half = new M3();
@@ -451,6 +479,7 @@ export class NukeEngine {
       const l = Cesium.Matrix4.multiplyByPoint(D.invEnu, P, this._sc || (this._sc = new Cesium.Cartesian3()));
       z += craterZ(Math.hypot(l.x, l.y), D.E, D.crv);
     }
+    if (this.maxStress > 6) z -= this.subsAt(Cesium.Cartographic.fromCartesian(P));
     return Math.max(z, -60000);
   }
   /** Height of the (deformed) surface: the single choke point for everything that stands on the ground. */
@@ -471,6 +500,51 @@ export class NukeEngine {
     return h + this.deformAt(P);
   }
 
+  // ---- global damage map: 2048x1024 equirectangular RGBA8, ~20 km texels (see GLSL dmgAt) ----
+  private MW = 2048; private MH = 1024;
+  private mStress = new Float32Array(2048 * 1024); private mScorch = new Float32Array(2048 * 1024); private mCrater = new Float32Array(2048 * 1024);
+  private mBytes = new Uint8Array(2048 * 1024 * 4); private mapDirty = false; private lastMap = 0; private maxStress = 0;
+  private mapUniform() {
+    const L = Cesium.TextureMinificationFilter.LINEAR, M = Cesium.TextureMagnificationFilter.LINEAR;
+    return new Cesium.TextureUniform({ typedArray: this.mBytes, width: this.MW, height: this.MH, pixelFormat: Cesium.PixelFormat.RGBA, pixelDatatype: Cesium.PixelDatatype.UNSIGNED_BYTE, repeat: true, minificationFilter: L, magnificationFilter: M });
+  }
+  /** a blast's lasting footprint: stress +1 inside r20 fading to 0 at r1, scorch, crater depth; area-weighted per texel */
+  private splat(D) {
+    const E = D.E, MW = this.MW, MH = this.MH, Re = 6371000;
+    const c = Cesium.Cartographic.fromCartesian(D.origin), lat0 = c.latitude, lon0 = c.longitude, R = E.crater, Dp = craterDepth(R);
+    const reach = E.r1 / Re, dLon = Math.min(Math.PI, reach / Math.max(Math.cos(lat0), 0.02));
+    const j0 = Math.max(0, Math.floor(((lat0 - reach) / Math.PI + 0.5) * MH)), j1 = Math.min(MH - 1, Math.floor(((lat0 + reach) / Math.PI + 0.5) * MH));
+    const i0 = Math.floor(((lon0 - dLon) / (2 * Math.PI) + 0.5) * MW), i1 = Math.floor(((lon0 + dLon) / (2 * Math.PI) + 0.5) * MW);
+    const ns = (2 * Math.PI * Re) / MW > 0.5 * E.r20 ? 4 : 1; // sub-texel blasts: 4x4 samples, so tiny ones add little
+    const sl0 = Math.sin(lat0), cl0 = Math.cos(lat0);
+    for (let j = j0; j <= j1; j++) for (let ii = i0; ii <= Math.min(i1, i0 + MW - 1); ii++) {
+      const i = ((ii % MW) + MW) % MW;
+      let st = 0, sc = 0, cd = 0;
+      for (let a = 0; a < ns; a++) for (let b = 0; b < ns; b++) {
+        const lat = ((j + (a + 0.5) / ns) / MH - 0.5) * Math.PI, lon = ((ii + (b + 0.5) / ns) / MW - 0.5) * 2 * Math.PI;
+        const d = Re * Math.acos(Math.min(1, sl0 * Math.sin(lat) + cl0 * Math.cos(lat) * Math.cos(lon - lon0)));
+        st += 1 - smooth(E.r20, E.r1, d);
+        sc += Math.max(1 - smooth(0.7 * E.r5, E.r5, d), 0.5 * (1 - smooth(0.85 * E.rth, E.rth, d))); // (rth can exceed r5)
+        if (R > 0 && d < R) cd += Dp * (1 - (d / R) ** 2);
+      }
+      const n = ns * ns, k = j * MW + i;
+      this.mStress[k] += st / n; this.mScorch[k] = Math.max(this.mScorch[k], sc / n); this.mCrater[k] = Math.max(this.mCrater[k], cd / n);
+      this.maxStress = Math.max(this.maxStress, this.mStress[k]);
+      const o = k * 4, q = this.mBytes;
+      q[o] = Math.min(255, Math.round(this.mScorch[k] * 255)); q[o + 1] = Math.min(255, Math.round(this.mStress[k] * 32));
+      q[o + 2] = this.mCrater[k] > 0 ? Math.min(255, Math.round((Math.log2(1 + this.mCrater[k]) / Math.log2(60001)) * 255)) : 0; q[o + 3] = 255;
+    }
+    this.mapDirty = true; this.padGen++;
+  }
+  private stressAt(carto) {
+    const MW = this.MW, MH = this.MH, x = (carto.longitude / (2 * Math.PI) + 0.5) * MW - 0.5, y = (carto.latitude / Math.PI + 0.5) * MH - 0.5;
+    const i = Math.floor(x), j = Math.max(0, Math.min(MH - 2, Math.floor(y))), fx = x - i, fy = Math.max(0, Math.min(1, y - j));
+    const g = (a, b) => this.mBytes[(b * MW + (((a % MW) + MW) % MW)) * 4 + 1] / 32;
+    return lerp(lerp(g(i, j), g(i + 1, j), fx), lerp(g(i, j + 1), g(i + 1, j + 1), fx), fy);
+  }
+  /** CPU mirror of the shader's subsidence, without the fissure noise (its mean instead) */
+  private subsAt(carto) { if (this.maxStress <= 6 || !carto) return 0; const st = this.stressAt(carto); return st <= 6 ? 0 : 5000 * smooth(6, 8, st) * 0.75; }
+
   // ---- bare-earth heightmaps (one 64x64 grid per blast, packed in a 4x4 float atlas, tile = shader slot) ----
   private atlas = new Float32Array(256 * 256 * 4); private atlasDirty = false; private lastAtlas = 0;
   private terrainP = null; private jobs = [];
@@ -482,6 +556,10 @@ export class NukeEngine {
   private runJobs() {
     const t0 = performance.now();
     if (this.jobs.length) { const restore = this.hideForSampling(); try { while (this.jobs.length && performance.now() - t0 < 8) { if (this.jobs[0]()) this.jobs.shift(); } } finally { restore(); } }
+    if (this.mapDirty && performance.now() - this.lastMap > 250) { // ≤ 4 uploads a second (8 MB each)
+      this.mapDirty = false; this.lastMap = performance.now();
+      this.bShader.setUniform('u_map', this.mapUniform());
+    }
     if (this.atlasDirty && performance.now() - this.lastAtlas > 250) {
       this.atlasDirty = false; this.lastAtlas = performance.now();
       this.bShader.setUniform('u_hm', this.atlasUniform());
@@ -603,13 +681,14 @@ export class NukeEngine {
     const h0 = Cesium.Cartographic.fromCartesian(D.origin).height, dz = Q.h0 - h0;
     D.hm = dz ? Q.hm.map((v) => v + dz) : Q.hm; D.h0 = h0; D.hmS = Q.S;
     D.hmSrc = Q.src; D.hmRes = Q.res; D.hmMargin = Q.margin;
+    this.padGen++; // padOf changes once a heightmap exists (leaning blocks)
     this.writeAtlas(D);
   }
   private writeAtlas(D) {
-    if (!D.hm) return;
+    if (!D.hm || D.slot < 0) return;
     const tx = D.slot % 4, ty = Math.floor(D.slot / 4);
     for (let j = 0; j < 64; j++) for (let i = 0; i < 64; i++) this.atlas[((ty * 64 + j) * 256 + tx * 64 + i) * 4] = D.hm[j * 64 + i];
-    this.atlasDirty = true; this.padGen++; this.poke();
+    this.atlasDirty = true; this.poke();
   }
   /** CPU bilinear of a blast's heightmap at blast-local x, y (m, relative to the origin) */
   private hmAt(D, x, y) {
@@ -635,6 +714,7 @@ export class NukeEngine {
       ccalls += `cfx(pEC, u_m${i}, u_a${i}, u_b${i}, u_d${i}, u_e${i}, best, bestEC, bestXY);\n`;
     }
     uniforms.u_hm = { type: U.SAMPLER_2D, value: this.atlasUniform() };
+    uniforms.u_map = { type: U.SAMPLER_2D, value: this.mapUniform() };
     uniforms.u_rings = { type: U.FLOAT, value: this.showRings ? 1 : 0 };
     this.bShader = new Cesium.CustomShader({
       uniforms,
@@ -652,11 +732,14 @@ export class NukeEngine {
         vec3 dEC = vec3(0.0);
         ${vcalls}
         // overlapping craters add up; never deeper than ~60 km
+        vec2 ll = lonLat(pEC);
+        float sub = subsidence(dmgAt(ll).g * 255.0 / 32.0, globeXY(ll));
+        dEC -= normalize(pEC - czm_view[3].xyz) * sub; // czm_view[3]: the Earth's centre in eye coordinates
         float L = length(dEC);
         if (L > 60000.0) dEC *= 60000.0 / L;
         vec4 best = vec4(0.0); vec3 bestEC = vec3(0.0); vec2 bestXY = vec2(0.0);
         ${ccalls}
-        v_col = best; v_rxy = bestXY;
+        v_col = vec4(best.xyz, sub); v_rxy = bestXY;
         vsOutput.positionMC += mat3(czm_inverseModelView) * (dEC + bestEC);
       }`,
       fragmentShaderText: GLSL_COMMON + `
@@ -666,6 +749,7 @@ export class NukeEngine {
         vec3 l = (M * vec4(pEC, 1.0)).xyz;
         float d = length(l.xy), maxR = a.w * 1.15;
         if (d > maxR * 1.05) return;
+        ck2.z = max(ck2.z, 1.0 - smoothstep(0.9 * a.w, 1.1 * a.w, d)); // this slot draws its own scar out to r1
         // blast darkening behind the front (as before)
         float lim = min(a.x, a.z);
         float k = (1.0 - smoothstep(lim * 0.85, lim, d)) * mix(0.55, 0.9, 1.0 - smoothstep(a.y * 0.7, a.y * 1.2, d));
@@ -685,6 +769,7 @@ export class NukeEngine {
           m.diffuse = mix(m.diffuse, vec3(0.24, 0.2, 0.155) * tint * (0.8 + 0.4 * n), rim * 0.7);
           // the bowl: dark vitrified glass with a faint sheen, glowing while hot
           float bowl = crv * (1.0 - smoothstep(0.85, 1.0, r));
+          ck2.w = max(ck2.w, max(bowl, rim)); // the crater wins over rubble tint (drawn after this loop)
           vec3 glass = mix(vec3(0.022, 0.02, 0.024), vec3(0.07, 0.065, 0.07), n2 * n2) * tint;
           m.diffuse = mix(m.diffuse, glass, bowl * 0.95);
           float heat = dd.z * bowl * (1.0 - smoothstep(0.3, 0.95, r));
@@ -713,7 +798,7 @@ export class NukeEngine {
           float sp = R > 0.0 ? 0.55 * R : 0.18 * a.y, rq = (d - r0) / sp + 0.4 * (wl - 0.5);
           float wCon = 0.7 * clamp(0.02 * max(R, 0.1 * a.y), 0.4, 40.0) * step(0.5, vn(vec2(ang * 9.0, floor(rq + 0.5)) + dd.w)) * step(r0, d) * (1.0 - smoothstep(0.5 * a.y, a.y, d));
           ck = vec4(ci, dd.z, wRad, wCon);
-          ck2 = vec4(abs(fract(sec + 0.5) - 0.5) / ns * 6.2832 * d, abs(fract(rq + 0.5) - 0.5) * sp, 0.0, 0.0);
+          ck2 = vec4(abs(fract(sec + 0.5) - 0.5) / ns * 6.2832 * d, abs(fract(rq + 0.5) - 0.5) * sp, ck2.z, ck2.w);
           ckXY = l.xy; ckUp = transpose(mat3(M)) * vec3(0.0, 0.0, 1.0);
         }
       }
@@ -737,9 +822,35 @@ export class NukeEngine {
         if (col > 0.02) {
           float r = vn(v_rxy / 2.5) * 0.6 + vn(v_rxy / 0.7) * 0.4;
           vec3 rub = mix(vec3(0.34, 0.31, 0.28), vec3(0.17, 0.15, 0.13), r) * mix(1.0, 0.5, fire);
-          material.diffuse = mix(material.diffuse, rub * tint, smoothstep(0.25, 0.7, col) * smoothstep(0.5, 2.5, abv) * 0.9 * (1.0 - smoothstep(4.0, 20.0, px)));
+          material.diffuse = mix(material.diffuse, rub * tint, smoothstep(0.25, 0.7, col) * smoothstep(0.5, 2.5, abv) * 0.9 * (1.0 - smoothstep(4.0, 20.0, px)) * (1.0 - ck2.w));
         }
         material.diffuse *= 1.0 - 0.45 * fire * smoothstep(3.0, 10.0, abv) * (1.0 - smoothstep(0.1, 0.4, col));
+        // the global damage map: old scars no slot draws (weighted by 1 - slot coverage), and cumulative stress
+        vec2 ll = lonLat(pEC); vec4 dm = dmgAt(ll); vec2 gxy = globeXY(ll);
+        float far = 1.0 - ck2.z;
+        vec3 upEC = normalize(pEC - czm_view[3].xyz);
+        float lvl = smoothstep(0.55, 0.85, abs(dot(nEC, upEC)));
+        material.diffuse = mix(material.diffuse, vec3(0.07, 0.055, 0.04) * tint, 0.85 * dm.r * far);
+        float cdep = exp2(dm.b * log2(60001.0)) - 1.0;
+        material.diffuse = mix(material.diffuse, vec3(0.03, 0.028, 0.03) * tint, smoothstep(5.0, 300.0, cdep) * far);
+        float st = dm.g * 255.0 / 32.0;
+        if (st > 2.0) { // > 2: cracks appear; > 4: they widen and glow, for good
+          float I = smoothstep(2.0, 4.0, st), hot = smoothstep(4.0, 6.0, st);
+          float e1 = vorEdge(gxy / 1500.0) * 1500.0, w1 = mix(1.0, 7.0, I) * (1.0 + hot) * step(0.6 - 0.25 * I, vn(gxy / 4000.0 + 1.7));
+          float e2 = vorEdge(gxy / 150.0 + 3.3) * 150.0, w2 = mix(0.3, 1.5, I) * step(0.55, vn(gxy / 500.0));
+          float big = fissure(e1, w1, px) * lvl, small = crackLine(e2, w2, px) * lvl;
+          float halo = crackLine(e1, w1 * 2.2, px) * lvl;
+          material.diffuse *= 1.0 - 0.4 * halo * I;
+          material.diffuse = mix(material.diffuse, vec3(0.012, 0.01, 0.009), max(big, small) * I);
+          material.diffuse += vec3(1.0, 0.33, 0.06) * hot * (0.9 * big + 0.1 * halo); // only the big fissures glow
+        }
+        // the floor of the deepest subsidence: a crust over glowing magma
+        float sub = v_col.w;
+        if (sub > 1200.0) {
+          float mg = smoothstep(1200.0, 5000.0, sub), n = vn(gxy / 2500.0), n2 = vn(gxy / 600.0 + 1.3);
+          material.diffuse = mix(material.diffuse, vec3(0.06, 0.03, 0.025) * mix(0.6, 1.2, n2) * tint, mg);
+          material.diffuse += vec3(1.0, 0.3, 0.04) * mg * (0.08 + 1.1 * smoothstep(0.62, 0.85, n) * smoothstep(0.35, 0.7, n2));
+        }
         // cracks: a broken Voronoi web (~60 m and ~8 m cells) plus the blast's radial and concentric cracks.
         // Dark core, wider inner shadow, glowing while hot. Ground and rubble only: never on walls or standing roofs.
         if (ck.x > 0.01) {
@@ -1048,8 +1159,10 @@ export class NukeEngine {
 
   clear() {
     [...this.blasts].forEach((D) => this.removeBlast(D));
+    this.slots.fill(null);
     this.jobs = []; this.atlas.fill(0); this.atlasDirty = true;
     this.preps.forEach((q) => (q.dead = true)); this.preps = [];
+    this.mStress.fill(0); this.mScorch.fill(0); this.mCrater.fill(0); this.mBytes.fill(0); this.maxStress = 0; this.mapDirty = true;
     this.flyers.forEach((f) => { this.rm(f.head); f.entity && this.viewer.entities.remove(f.entity); }); this.flyers = [];
     this.particles.forEach((p) => this.rm(p.b)); this.particles = [];
     this.ducks.forEach((d) => { d.model && this.scene.primitives.remove(d.model); d.bb && this.rm(d.bb); }); this.ducks = [];
@@ -1241,11 +1354,49 @@ export class NukeEngine {
     s.setUniform('u_d' + slot, D ? new Cesium.Cartesian4(D.E.crater, D.crv, D.heat, D.seed) : new Cesium.Cartesian4());
     s.setUniform('u_e' + slot, D ? new Cesium.Cartesian4(D.hm ? D.slot : -1, D.hmS || 0, D.cshock, D.E.hob) : new Cesium.Cartesian4(-1, 0, 0, 0));
   }
+  /** an old blast gives up its animation layers; the scar (crater, rubble, cracks, heightmap) stays */
+  private retire(D) {
+    if (D.retired) return;
+    D.retired = true;
+    D.entities.forEach((e) => this.viewer.entities.remove(e)); D.entities = [];
+    if (D.ground) { this.scene.primitives.remove(D.ground); D.ground = null; D.groundMat = null; }
+  }
+  private animating(D) { return D.t < D.E.Trise * 3 || !D.heard || D.heat > 0; }
+  /**
+   * Hand the 16 shader slots out to the scars that matter most for this view (closest to the look-at point,
+   * relative to their size), blasts still animating strongly preferred, with hysteresis so slots do not flap.
+   * A scar under ~2 px on screen gets none: the global damage map draws it.
+   */
+  private schedule(force = false) {
+    const C3 = Cesium.Cartesian3, cam = this.camera, N = this.MAX;
+    if (!force && !this.blasts.length) return;
+    const look = cam.pickEllipsoid(new Cesium.Cartesian2(this.cv.clientWidth / 2, this.cv.clientHeight / 2)) || cam.positionWC;
+    const k = this.cv.clientHeight / (2 * Math.tan((cam.frustum.fovy || 1) / 2));
+    // (a Tsar "animates" for ~13 real minutes: plain animating-first would starve every old crater in view)
+    const score = (D) => {
+      const r = D.E.r1, dc = C3.distance(cam.positionWC, D.groundPos);
+      if ((r / Math.max(dc - r, 1)) * k < 2) return Infinity;
+      let sc = Math.max(0, C3.distance(look, D.groundPos) - r) / r;
+      if (this.animating(D)) sc = sc * 0.3 - (D.t < D.E.Trise ? 2 : 1); // still blasting: wins unless far off
+      if (D.slot >= 0) sc -= 0.25 + 0.3 * Math.abs(sc); // hysteresis (subtract: scores can be negative)
+      return sc;
+    };
+    const want = this.blasts.map((D) => [score(D), D]).filter((x) => x[0] < Infinity).sort((a, b) => a[0] - b[0]).slice(0, N).map((x) => x[1]);
+    const keep = new Set(want);
+    for (let i = 0; i < N; i++) { const H = this.slots[i]; if (H && !keep.has(H)) { H.slot = -1; this.slots[i] = null; } }
+    for (const D of want) {
+      if (D.slot >= 0) continue;
+      const i = this.slots.indexOf(null); if (i < 0) break;
+      this.slots[i] = D; D.slot = i;
+      this.writeAtlas(D);
+    }
+    for (let i = 0; i < N; i++) this.setSlot(i, this.slots[i]);
+  }
   private removeBlast(D) {
     D.dead = true;
     if (D.ground) this.scene.primitives.remove(D.ground);
     D.entities.forEach((e) => this.viewer.entities.remove(e));
-    this.setSlot(D.slot, null);
+    if (D.slot >= 0) { this.slots[D.slot] = null; this.setSlot(D.slot, null); D.slot = -1; }
     this.blasts = this.blasts.filter((b) => b !== D); this.padGen++;
   }
   private makePuffs(E, scale) {
@@ -1265,14 +1416,13 @@ export class NukeEngine {
     const C3 = Cesium.Cartesian3;
     const groundPos = C3.clone(picked);
     const E = effects(w.W, w.air, w.hob);
-    if (this.blasts.length >= this.MAX) this.removeBlast(this.blasts[0]);
-    let slot = this.nextSlot; while (this.blasts.some((b) => b.slot === slot)) slot = (slot + 1) % this.MAX;
-    this.nextSlot = (slot + 1) % this.MAX;
+    // every blast stays as a permanent scar until clear(); the 16 shader slots are handed out each frame (schedule)
+    const slot = -1;
     const enu = Cesium.Transforms.eastNorthUpToFixedFrame(groundPos);
     const local = (x, y, z, out?) => Cesium.Matrix4.multiplyByPoint(enu, C3.fromElements(x, y, z, out || new C3()), out || new C3());
     const gen = opts.gen || 0;
     const D: any = {
-      E, w, slot, groundPos, enu, local, t: 0, real: 0, shock: 0, burn: 0, glowB: 0, entities: [], rings: {},
+      E, w, slot, id: ++this.blastId, groundPos, enu, local, cloudA: 1, t: 0, real: 0, shock: 0, burn: 0, glowB: 0, entities: [], rings: {},
       up: Cesium.Ellipsoid.WGS84.geodeticSurfaceNormal(groundPos, new C3()),
       puffs: this.makePuffs(E, gen ? 0.55 : 1), heard: false, gen, children: [],
     };
@@ -1313,8 +1463,11 @@ export class NukeEngine {
       asynchronous: false,
     }));
     this.blasts.push(D); this.padGen++;
-    this.setSlot(slot, D);
+    // only the newest 16 keep their animation layers (clouds, rings, globe decal), like the old 16-blast cap did
+    const old = this.blasts[this.blasts.length - 1 - this.MAX];
+    if (old) this.retire(old);
     this.startHeightmap(D);
+    this.schedule(true);
 
     if (this.chain && gen < 2) {
       for (let i = 0, n = gen === 0 ? 3 : 2; i < n; i++)
@@ -1330,7 +1483,7 @@ export class NukeEngine {
     if (E.H > 8848) u('everest');
     if (E.H >= 99000) u('karman');
     if (['tsar', 'dino', 'rod'].includes(w.id)) u(w.id);
-    if (this.blasts.length >= 6) u('six');
+    if (this.blasts.filter((b) => !b.retired).length >= 6) u('six');
     if (s.area >= 1000) u('area');
     D.root.chainCount = (D.root.chainCount || 0) + 1;
     if (D.root.chainCount >= 9) u('chain');
@@ -1441,6 +1594,7 @@ export class NukeEngine {
         size = dH * 1.8 + dR * 0.15; shade = 0.9; base = [0.78 * tn[0], 0.7 * tn[1], 0.62 * tn[2]];
         alpha = 0.2 * (1 - smooth(E.Trise * 0.4, E.Trise * 1.1, t));
       }
+      alpha *= D.cloudA;
       if (size < 0.5 || alpha <= 0.005) continue;
       const pos = D.local(x, y, z, new Cesium.Cartesian3());
       const k = clamp01(heat * glow), o = under * glow2 * (0.6 + 0.6 * night), v = 0.95 + 0.1 * p.r4;
@@ -1470,7 +1624,9 @@ export class NukeEngine {
     D.crv = smooth(E.tmax * 0.5, E.tmax * 3 + 1, t);
     // glowing crater floor and cracks: cools in REAL time (sim time runs up to 12x faster), black after ~a minute
     const heat = Math.min(1, smooth(0, 1.5, D.real) * 1.2) * Math.exp(-D.real / 20); D.heat = D.real > 2 && heat < 0.01 ? 0 : heat;
-    this.setSlot(D.slot, D);
+    // retired blasts fade their cloud out, then drop it
+    if (!D.splatted && (D.shock >= E.r1 || !this.animating(D))) { D.splatted = true; if (this.tileset) this.splat(D); }
+    if (D.retired && D.puffs.length) { D.cloudA = Math.max(0, D.cloudA - dt / 8); if (!D.cloudA) D.puffs = []; }
     if (D.groundMat) { const u = D.groundMat.uniforms; u.shock = D.shock / D.maxR; u.glow = Math.min(0.9, 1.2 * glow); u.burn = smooth(0, E.tmax * 2, t); u.crv = D.crv; }
     this.addRing(D, 'fb', E.Rfb, '#ffd84a');
     if (t > E.tmax) { this.addRing(D, 'rad', E.rrad, '#55dd66'); this.addRing(D, 'th', E.rth, '#ffb84d'); }
@@ -2079,11 +2235,14 @@ export class NukeEngine {
     const items = [];
     let flash = 0, warm = 0;
     for (const D of [...this.blasts]) {
+      if (D.done) continue; // a finished scar: nothing left to animate
       this.updateBlast(D, dt);
       this.cloudItems(D, D.dtSim, items);
       flash = Math.max(flash, D.flash); warm = Math.max(warm, D.warm);
+      if (D.retired && !D.puffs.length && !this.animating(D)) D.done = true;
     }
     this.FLASH = flash; this.WARM = warm;
+    this.schedule();
     items.sort((a, b) => b.d - a.d);
     const pool = this.puffPool;
     while (pool.length < items.length) pool.push(this.bb(this.puffs, 'puff', { sizeInMeters: true, width: 1, height: 1, show: false }));

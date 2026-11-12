@@ -68,6 +68,28 @@ Not checked: a hilly city or coast (Milan only), a moving-camera visual check fo
   at 8 s, faint at 35 s, black cracks at 65 s; reads at 500 m (wide fissures + web across the rubble) and 50 km
   (radial + concentric fissure pattern).
 
+## Phase 4 notes (persistence)
+
+- No eviction: every blast stays as a scar until `clear()`. Only the newest 16 keep clouds (faded out over 8 s,
+  then freed), rings and the globe decal; the scar keeps crater, collapse, cracks and its heightmap.
+- Slots are scheduled every frame by view relevance (distance from the look-at point relative to r1), animating
+  blasts strongly preferred, scars under 2 px dropped. "Animating first" alone did not work: a Tsar animates
+  for ~13 real minutes (sim time drops back to real time after 1.3 Trise), so 40 of them starved every old
+  crater. Hysteresis must subtract (scores go negative); a multiplicative one made slots flap every frame and
+  invalidated all tile padding 175 times a second (13 fps).
+- Global map 2048x1024 RGBA8, sampled with a 4-tap cubic B-spline (a Tsar's scorch is ~1 texel: bilinear drew
+  squares). Map scorch/crater are weighted by (1 - slot coverage) to avoid double counting.
+- Subsidence noise uses 30 / 60 km wavelengths: a 9 km octave opened straight seams where coarse and fine LOD
+  tiles meet with few shared vertices.
+- Verified (Chrome, Google tiles): 40 Tsars (25 in a cluster around Munich, 15 spread) + 3 Ivy Mikes: scars
+  visible from orbit; the cluster (stress up to 16) sinks ~3.7 km with a glowing magma crust and hot fissures;
+  zooming into the oldest crater (Paris Ivy Mike) while 40 blasts still animate shows its bowl, glass floor and
+  cracks (it gets slot 6). Frame time with 40 Tsars: orbit 35 fps (39 without blasts), Munich 33 fps (45).
+- Heightmap prep for 40 sites takes ~90 s at orbit: `sampleHeight` costs ~31 ms there (one per frame), so frames
+  hitch while it drains. Paris calibration residuals spread -91..+186 m (samples from tiles not loaded at that
+  altitude), so the margin hit its 12 m cap.
+- Not done: the optional camera-following regional map; the antimeridian splat wraps but was not tested.
+
 Goal: when a bomb goes off, the world is physically changed. Real craters, buildings that collapse as
 the shock front passes, ground cracks, flying debris, and cumulative damage that lets Tsar-spam sink
 and crack a whole continent. Everything persists until `clear()`.
