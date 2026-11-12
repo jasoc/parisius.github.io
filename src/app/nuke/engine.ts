@@ -226,7 +226,7 @@ export class NukeEngine {
   private needsFrames() {
     return this.blasts.some((D) => D.t < D.E.Trise * 3 || !D.heard) || this.flyers.length > 0 || this.particles.length > 0 ||
       this.bombs.length > 0 || this.planes.length > 0 || this.turrets.length > 0 || this.ufos.length > 0 || this.ducks.some((d) => !d.rest) ||
-      this.shake.amp > 0 || this.keys.size > 0 || this.recentering || this.FLASH > 0.001;
+      this.shake.amp > 0 || this.keys.size > 0 || this.recentering || this.zoomPending !== 0 || this.FLASH > 0.001;
   }
   private poke() { this.scene?.requestRender(); }
 
@@ -333,15 +333,35 @@ export class NukeEngine {
     const T = Cesium.CameraEventType, M = Cesium.KeyboardEventModifier;
     ctl.rotateEventTypes = T.LEFT_DRAG;
     ctl.translateEventTypes = T.LEFT_DRAG;
-    ctl.zoomEventTypes = [T.WHEEL, T.PINCH];
+    ctl.zoomEventTypes = [T.PINCH]; // wheel zoom is ours (see 'wheel' below): Cesium's escapes into space when no globe is under the cursor
     ctl.enableTilt = false;
     ctl.lookEventTypes = [{ eventType: T.LEFT_DRAG, modifier: M.CTRL }];
     ctl.minimumZoomDistance = 15;
+    ctl.maximumZoomDistance = 2.5e7; // whole globe in view, never lost in deep space
     ctl.enableCollisionDetection = true;
     this.viewer.cesiumWidget.screenSpaceEventHandler.removeInputAction(Cesium.ScreenSpaceEventType.LEFT_DOUBLE_CLICK);
 
     const on = (t, type, fn, o?) => { t.addEventListener(type, fn, o); this.disposers.push(() => t.removeEventListener(type, fn, o)); };
     on(cv, 'contextmenu', (e) => e.preventDefault());
+    // Wheel zoom: always toward/away from a point ON the globe (under the cursor, or the nearest one),
+    // eased over a few frames. Zooming out also arms the gentle re-centring (heading frozen at its value now).
+    on(cv, 'wheel', (e) => {
+      e.preventDefault();
+      const r = cv.getBoundingClientRect(), pos = new Cesium.Cartesian2(e.clientX - r.left, e.clientY - r.top);
+      const dy = e.deltaMode === 1 ? e.deltaY * 40 : e.deltaY;
+      let P = this.pickWorld(pos) || camera.pickEllipsoid(new Cesium.Cartesian2(cv.clientWidth / 2, cv.clientHeight / 2));
+      if (!P) { // looking at space: zoom toward the point of the Earth right below the camera
+        const c = Cesium.Cartographic.fromCartesian(camera.positionWC); c.height = 0;
+        P = Cesium.Cartographic.toCartesian(c);
+      }
+      this.zoomTarget = P;
+      this.zoomPending = Cesium.Math.clamp((this.zoomPending || 0) + dy * 0.0016, -3, 3);
+      if (dy > 0) {
+        if (performance.now() > this.zoomOutUntil) this.recenterHeading = camera.heading;
+        this.zoomOutUntil = performance.now() + 900;
+      }
+      this.poke();
+    }, { passive: false });
     on(cv, 'mousedown', (e) => { if (e.button === 1) e.preventDefault(); });
     const evPos = (e) => { const r = cv.getBoundingClientRect(); return new Cesium.Cartesian2(e.clientX - r.left, e.clientY - r.top); };
     const orbit = (P, axis, angle) => {
@@ -364,6 +384,7 @@ export class NukeEngine {
         d.az0 = Math.hypot(v.x, v.y) > 1 ? Math.atan2(v.x, v.y) : camera.heading + Math.PI; // compass bearing P -> camera
         d.h0 = camera.heading;
         d.p0 = camera.pitch;
+        d.h0alt = Cesium.Cartographic.fromCartesian(camera.positionWC).height;
       }
       this.drag = d;
       try { cv.setPointerCapture(e.pointerId); } catch {}
@@ -385,15 +406,17 @@ export class NukeEngine {
       // A small dead zone keeps a vertical drag from also rotating, and vice versa. Roll is always 0.
       const dead = (v) => Math.sign(v) * Math.max(0, Math.abs(v) - 10);
       const tx = dead(p.x - d.start.x), ty = dead(p.y - d.start.y);
-      const lo = Cesium.Math.toRadians(3), hi = Cesium.Math.toRadians(89.5);
-      const el = Cesium.Math.clamp(d.el0 + ty * (Math.PI / cv.clientHeight), lo, hi);
+      // tilt range shrinks with altitude: from far away you cannot tilt the globe off screen
+      const pMax = this.maxPitch(d.h0alt);
+      const lo = Math.max(Cesium.Math.toRadians(3), d.el0 - Math.max(0, pMax - d.p0)), hi = Cesium.Math.toRadians(89.5);
+      const el = Cesium.Math.clamp(d.el0 + ty * (Math.PI / cv.clientHeight), Math.min(lo, d.el0), hi);
       const az = d.az0 + tx * ((2 * Math.PI) / cv.clientWidth);
       const pos = Cesium.Matrix4.multiplyByPoint(d.enu, new C3(d.R * Math.cos(el) * Math.sin(az), d.R * Math.cos(el) * Math.cos(az), d.R * Math.sin(el)), new C3());
       camera.setView({
         destination: pos,
         orientation: {
           heading: d.h0 + (az - d.az0),
-          pitch: Cesium.Math.clamp(d.p0 - (el - d.el0), -Cesium.Math.PI_OVER_TWO, -0.01),
+          pitch: Cesium.Math.clamp(d.p0 - (el - d.el0), Cesium.Math.toRadians(-89.5), Math.max(pMax, d.p0)),
           roll: 0,
         },
       });
@@ -442,7 +465,33 @@ export class NukeEngine {
     camera.flyToBoundingSphere(new Cesium.BoundingSphere(t, 0), { offset: new Cesium.HeadingPitchRange(heading, pitch, Cesium.Cartesian3.distance(camera.positionWC, t)), duration: 0.6 });
   }
   northUp() { this.flyAround(0, this.camera.pitch); }
-  topDown() { this.flyAround(this.camera.heading, -Cesium.Math.PI_OVER_TWO); }
+  topDown() { this.flyAround(this.camera.heading, Cesium.Math.toRadians(-89.5)); }
+  private zoomOutUntil = 0; private recenterHeading = null;
+  private zoomPending = 0; private zoomTarget = null;
+  /** apply part of the pending wheel zoom (log-distance steps toward/away from zoomTarget), never past the limits */
+  private applyZoom(dt) {
+    if (!this.zoomPending || !this.zoomTarget) return;
+    const C3 = Cesium.Cartesian3, cam = this.camera;
+    const step = this.zoomPending * Math.min(1, dt * 14);
+    this.zoomPending -= step;
+    if (Math.abs(this.zoomPending) < 0.002) this.zoomPending = 0;
+    const P = this.zoomTarget, rel = C3.subtract(cam.positionWC, P, new C3());
+    const d = C3.magnitude(rel);
+    let nd = Cesium.Math.clamp(d * Math.exp(step), 20, 4e7);
+    let pos = C3.add(P, C3.multiplyByScalar(rel, nd / d, new C3()), new C3());
+    // never above the max altitude, never below the surface
+    const at = (x) => C3.add(P, C3.multiplyByScalar(rel, x / d, new C3()), new C3());
+    const H = (x) => Cesium.Cartographic.fromCartesian(at(x)).height;
+    if (nd > d && H(nd) > 2.5e7) {
+      // the farthest distance that stays under the 25,000 km ceiling
+      let lo = d, hi = nd;
+      for (let i = 0; i < 20; i++) { const mid = (lo + hi) / 2; if (H(mid) > 2.5e7) hi = mid; else lo = mid; }
+      nd = lo; pos = at(nd);
+      this.zoomPending = 0;
+    }
+    if (Cesium.Cartographic.fromCartesian(pos).height < 15) { this.zoomPending = 0; return; }
+    cam.setView({ destination: pos, orientation: { heading: cam.heading, pitch: cam.pitch, roll: cam.roll } });
+  }
 
   private handleKeys(dt) {
     const { keys, camera } = this, C3 = Cesium.Cartesian3;
@@ -454,7 +503,7 @@ export class NukeEngine {
       if (keys.has('ArrowUp')) dp += 0.8 * dt; if (keys.has('ArrowDown')) dp -= 0.8 * dt;
       const t = (dh || dp) && this.centerPoint();
       if (t) {
-        camera.lookAt(t, new Cesium.HeadingPitchRange(camera.heading + dh, Cesium.Math.clamp(camera.pitch + dp, -Cesium.Math.PI_OVER_TWO, -0.02), C3.distance(camera.positionWC, t)));
+        camera.lookAt(t, new Cesium.HeadingPitchRange(camera.heading + dh, Cesium.Math.clamp(camera.pitch + dp, Cesium.Math.toRadians(-89.5), -0.02), C3.distance(camera.positionWC, t)));
         camera.lookAtTransform(Cesium.Matrix4.IDENTITY);
       }
     } else {
@@ -493,7 +542,7 @@ export class NukeEngine {
     const c = Cesium.Cartographic.fromCartesian(this.camera.positionWC);
     const h = Cesium.Math.clamp(c.height, 1500, 2.0e7);
     this.drag = null;
-    this.camera.flyTo({ destination: Cesium.Cartesian3.fromRadians(c.longitude, c.latitude, h), orientation: { heading: 0, pitch: -Cesium.Math.PI_OVER_TWO, roll: 0 }, duration: 0.8 });
+    this.camera.flyTo({ destination: Cesium.Cartesian3.fromRadians(c.longitude, c.latitude, h), orientation: { heading: 0, pitch: Cesium.Math.toRadians(-89.5), roll: 0 }, duration: 0.8 });
   }
   setLabels(on: boolean) {
     this.labelsOn = on;
@@ -1468,21 +1517,37 @@ export class NukeEngine {
   /** Google Earth feel: the further out you zoom, the more the view tilts back to straight down, so the globe stays centred. */
   private recentering = false;
   private recenter(dt) {
-    const cam = this.camera, h = Cesium.Cartographic.fromCartesian(cam.positionWC).height;
-    const k = smooth(150e3, 2.5e6, h);
-    const target = -Cesium.Math.PI_OVER_TWO;
-    const diff = target - cam.pitch;
+    // Only while the user is zooming OUT with the wheel, and never all the way to -90°:
+    // straight down, heading and roll are undefined and reading them back makes the globe spin.
     this.recentering = false;
-    if (this.drag || k <= 0 || (Math.abs(diff) < 0.002 && Math.abs(cam.roll) < 0.002)) return;
+    if (this.drag) return;
+    const cam = this.camera, h = Cesium.Cartographic.fromCartesian(cam.positionWC).height;
+    const zoomingOut = performance.now() <= this.zoomOutUntil;
+    // 1) the higher you are, the less you may tilt (Google Earth): never tilt the globe off screen
+    const allowed = this.maxPitch(h);
+    let target = null, rate = 4;
+    if (cam.pitch > allowed + 0.003) target = allowed;
+    // 2) while zooming out, ease further toward (almost) straight down so the globe stays centred
+    if (zoomingOut) {
+      const k = smooth(150e3, 2.5e6, h);
+      const t2 = lerp(cam.pitch, Cesium.Math.toRadians(-88), k);
+      if (k > 0 && t2 < cam.pitch - 0.002) { target = Math.min(target ?? t2, t2); rate = 3 * Math.max(k, 0.3); }
+    }
+    if (target === null) return;
     this.recentering = true;
-    const f = Math.min(1, dt * 3 * k);
-    cam.setView({ orientation: { heading: cam.heading, pitch: cam.pitch + diff * f, roll: cam.roll * (1 - f) } });
+    const f = Math.min(1, dt * rate);
+    cam.setView({ orientation: { heading: zoomingOut ? (this.recenterHeading ?? cam.heading) : cam.heading, pitch: cam.pitch + (target - cam.pitch) * f, roll: 0 } });
+  }
+  /** steepest-to-horizon pitch allowed at a given altitude: -1° near the ground, ~-80° when the whole globe is in view */
+  private maxPitch(h) {
+    return -Cesium.Math.toRadians(lerp(1, 86, smooth(120e3, 6e6, h)));
   }
 
   private lastHeading = 999;
   private frame(dt) {
     this.applyShake(dt);
     this.handleKeys(dt);
+    this.applyZoom(dt);
     this.recenter(dt);
     this.updateSun();
     const hd = Cesium.Math.toDegrees(this.camera.heading);
