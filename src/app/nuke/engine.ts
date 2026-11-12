@@ -210,6 +210,25 @@ const GLSL_COMMON = `
     float lump = 0.12 * Dp * n * (1.0 - smoothstep(1.3, 2.5, r)) * smoothstep(0.0, 0.5, r + big);
     return (bowl + rim + ej + peak + lump) * crv;
   }
+  // distance (cell units) to the nearest Voronoi cell border (F2-F1 style, exact border distance)
+  float vorEdge(vec2 x) {
+    vec2 n = floor(x), f = fract(x), mr = vec2(0.0), mg = vec2(0.0);
+    float md = 8.0;
+    for (int j = -1; j <= 1; j++) for (int i = -1; i <= 1; i++) {
+      vec2 g = vec2(float(i), float(j)), r = g + vec2(h21(n + g), h21(n + g + 19.19)) - f;
+      float d = dot(r, r); if (d < md) { md = d; mr = r; mg = g; }
+    }
+    md = 8.0;
+    for (int j = -2; j <= 2; j++) for (int i = -2; i <= 2; i++) {
+      vec2 g = mg + vec2(float(i), float(j)), r = g + vec2(h21(n + g), h21(n + g + 19.19)) - f;
+      if (dot(mr - r, mr - r) > 1e-5) md = min(md, dot(0.5 * (mr + r), normalize(r - mr)));
+    }
+    return md;
+  }
+  // a line of half-width w (m) at distance dist (m); thinner than a pixel (px m) it fades instead of shimmering
+  float crackLine(float dist, float w, float px) { return w <= 0.0 ? 0.0 : (1.0 - smoothstep(w, w + px, dist)) * clamp(w / px, 0.0, 1.0); }
+  // major fissures stay at least ~a pixel wide from far away (so they still read from 50 km), dimmed by coverage
+  float fissure(float dist, float w, float px) { if (w <= 0.0) return 0.0; float W = max(w, 0.75 * px); return (1.0 - smoothstep(W, W + px, dist)) * clamp(2.5 * w / px, 0.0, 1.0); }
   // bare-earth height (m, relative to the blast origin) from the 4x4 atlas of 64x64 per-blast heightmaps;
   // float textures are not linearly filterable everywhere: NEAREST + manual bilinear
   float hmFetch(int k, ivec2 g) { g = clamp(g, ivec2(0), ivec2(63)); return texelFetch(u_hm, ivec2((k % 4) * 64, (k / 4) * 64) + g, 0).r; }
@@ -239,7 +258,9 @@ const GLSL_COLLAPSE = `
     vec2 q = l.xy / 35.0 + dd.w;
     float nb = vn(q), nb2 = vn(q + 17.3), nb3 = vn(q * 0.6 + 41.7);
     float Lt = max(60.0, 0.25 * a.y);
-    float prog = smoothstep(0.0, Lt, e.z - d - nb3 * Lt * 0.6) * terrain; // e.z: the front as far as collapse knows
+    // e.z: the front as far as collapse knows. Fades out 12-25 km from the camera: buildings are sub-pixel there,
+    // and squashing coarse LOD tiles opens seams against their finer neighbours
+    float prog = smoothstep(0.0, Lt, e.z - d - nb3 * Lt * 0.6) * terrain * (1.0 - smoothstep(12000.0, 25000.0, length(pEC)));
     if (prog <= 0.0) return;
     float Rfb = max((b.w - e.w) / 3.0, 1.0);
     float vap = e.w < Rfb ? 1.0 - smoothstep(0.5 * Rfb, 0.65 * Rfb, d) : 0.0; // vaporised: nothing left, no rubble
@@ -355,7 +376,7 @@ export class NukeEngine {
     return this.blasts.some((D) => D.t < D.E.Trise * 3 || !D.heard) || this.flyers.length > 0 || this.particles.length > 0 ||
       this.bombs.length > 0 || this.planes.length > 0 || this.turrets.length > 0 || this.ufos.length > 0 || this.ducks.some((d) => !d.rest) ||
       this.shake.amp > 0 || this.keys.size > 0 || this.recentering || this.zoomPending !== 0 || this.FLASH > 0.001 ||
-      this.jobs.length > 0 || this.atlasDirty || (this.armed && this.hoverRest && !this.hoverRest.done);
+      this.jobs.length > 0 || this.atlasDirty || this.blasts.some((D) => D.heat > 0) || (this.armed && this.hoverRest && !this.hoverRest.done);
   }
   private poke() { this.scene?.requestRender(); }
 
@@ -609,7 +630,7 @@ export class NukeEngine {
       uniforms['u_b' + i] = { type: U.VEC4, value: new Cesium.Cartesian4(0, 0, 0, 1) }; // rth, burn, glowB, glow radius
       uniforms['u_d' + i] = { type: U.VEC4, value: new Cesium.Cartesian4() }; // crater radius, crater progress, heat, seed
       uniforms['u_e' + i] = { type: U.VEC4, value: new Cesium.Cartesian4() }; // atlas idx, atlas half-extent, collapse, hob
-      calls += `fx(pEC, u_m${i}, u_a${i}, u_b${i}, u_d${i}, u_e${i}, tint, material);\n`;
+      calls += `fx(pEC, u_m${i}, u_a${i}, u_b${i}, u_d${i}, u_e${i}, tint, material, ck, ck2, ckXY, ckUp);\n`;
       vcalls += `dEC += vfx(pEC, u_m${i}, u_a${i}, u_b${i}, u_d${i}, u_e${i});\n`;
       ccalls += `cfx(pEC, u_m${i}, u_a${i}, u_b${i}, u_d${i}, u_e${i}, best, bestEC, bestXY);\n`;
     }
@@ -639,7 +660,8 @@ export class NukeEngine {
         vsOutput.positionMC += mat3(czm_inverseModelView) * (dEC + bestEC);
       }`,
       fragmentShaderText: GLSL_COMMON + `
-      void fx(vec3 pEC, mat4 M, vec4 a, vec4 b, vec4 dd, vec4 e, vec3 tint, inout czm_modelMaterial m) {
+      void fx(vec3 pEC, mat4 M, vec4 a, vec4 b, vec4 dd, vec4 e, vec3 tint, inout czm_modelMaterial m,
+              inout vec4 ck, inout vec4 ck2, inout vec2 ckXY, inout vec3 ckUp) {
         if (a.y <= 0.0) return;
         vec3 l = (M * vec4(pEC, 1.0)).xyz;
         float d = length(l.xy), maxR = a.w * 1.15;
@@ -666,7 +688,7 @@ export class NukeEngine {
           vec3 glass = mix(vec3(0.022, 0.02, 0.024), vec3(0.07, 0.065, 0.07), n2 * n2) * tint;
           m.diffuse = mix(m.diffuse, glass, bowl * 0.95);
           float heat = dd.z * bowl * (1.0 - smoothstep(0.3, 0.95, r));
-          m.emissive += vec3(1.0, 0.36, 0.08) * heat * (0.35 + 0.9 * smoothstep(0.45, 0.8, vn(q * 7.0)));
+          m.diffuse += vec3(1.0, 0.36, 0.08) * heat * (0.35 + 0.9 * smoothstep(0.45, 0.8, vn(q * 7.0)));
         }
         // shock ring travelling outward (ring toggle)
         float sh = a.x / maxR;
@@ -674,10 +696,28 @@ export class NukeEngine {
           float rr = d / maxR;
           float ring = smoothstep(sh - 0.035, sh, rr) * (1.0 - smoothstep(sh, sh + 0.006, rr)) * (1.0 - smoothstep(0.75, 1.0, sh));
           m.diffuse = mix(m.diffuse, vec3(1.0, 0.8, 0.55), ring * 0.5);
-          m.emissive += vec3(1.0, 0.7, 0.4) * ring * 0.25;
+          m.diffuse += vec3(1.0, 0.7, 0.4) * ring * 0.25;
         }
         m.diffuse += vec3(1.0, 0.55, 0.2) * b.z / (1.0 + pow(d / b.w, 2.0));
+        // ground cracks: strongest from the crater rim out to r20, gone by r5; ground bursts far more than air bursts.
+        // Only the strongest blast's field is kept (its precise local frame also carries the shared crack web).
+        float gf = R > 0.0 ? 1.0 : 0.35 * (1.0 - smoothstep(Rfb, 4.0 * Rfb, e.w));
+        float ci = gf * (1.0 - smoothstep(a.y, a.z, d)) * smoothstep(d, d + 0.1 * a.y + 1.0, a.x);
+        if (ci > ck.x) {
+          float ang = atan(l.y, l.x) / 6.2832 + 0.5, wl = vn(l.xy / (0.15 * a.y + 1.0) + dd.w);
+          // radial cracks: hashed angular sectors (domain-warped), each running out to its own length
+          float ns = floor(10.0 + 14.0 * h21(vec2(dd.w, 3.7))), sec = ang * ns + 0.35 * (wl - 0.5);
+          float rLen = mix(0.45, 1.0, h21(vec2(floor(sec + 0.5), dd.w))) * a.y, r0 = R > 0.0 ? 0.9 * R : 0.15 * a.y;
+          float wRad = clamp(0.02 * max(R, 0.1 * a.y), 0.4, 40.0) * (1.0 - smoothstep(0.6 * rLen, rLen, d)) * step(r0, d);
+          // concentric arcs at multiples of the crater radius (or of r20 for air bursts)
+          float sp = R > 0.0 ? 0.55 * R : 0.18 * a.y, rq = (d - r0) / sp + 0.4 * (wl - 0.5);
+          float wCon = 0.7 * clamp(0.02 * max(R, 0.1 * a.y), 0.4, 40.0) * step(0.5, vn(vec2(ang * 9.0, floor(rq + 0.5)) + dd.w)) * step(r0, d) * (1.0 - smoothstep(0.5 * a.y, a.y, d));
+          ck = vec4(ci, dd.z, wRad, wCon);
+          ck2 = vec4(abs(fract(sec + 0.5) - 0.5) / ns * 6.2832 * d, abs(fract(rq + 0.5) - 0.5) * sp, 0.0, 0.0);
+          ckXY = l.xy; ckUp = transpose(mat3(M)) * vec3(0.0, 0.0, 1.0);
+        }
       }
+      // NB: Google tiles are unlit, and the unlit path ignores material.emissive: glows are added to diffuse
       void fragmentMain(FragmentInput fsInput, inout czm_modelMaterial material) {
         vec3 p = fsInput.attributes.positionWC, pEC = fsInput.attributes.positionEC;
         // per-pixel day/night: the sun lights half the globe, with a soft terminator and a warm golden band
@@ -686,15 +726,36 @@ export class NukeEngine {
         float golden = day * (1.0 - smoothstep(0.04, 0.38, sd));
         vec3 tint = mix(vec3(0.09, 0.12, 0.21), vec3(1.0), day) * mix(vec3(1.0), vec3(1.14, 0.86, 0.66), golden);
         material.diffuse *= tint;
+        // derivatives up here, in uniform control flow: metres per pixel and the surface normal (tiles have none)
+        vec3 dpx = dFdx(pEC), dpy = dFdy(pEC);
+        float px = max(max(length(dpx), length(dpy)), 1e-3);
+        vec3 nEC = normalize(cross(dpx, dpy));
+        vec4 ck = vec4(0.0), ck2 = vec4(0.0); vec2 ckXY = vec2(0.0); vec3 ckUp = vec3(0.0, 0.0, 1.0);
         ${calls}
         // collapsed buildings: the stretched photo turns into rubble (burnt in the fire zone); soot on standing walls
         float col = v_col.x, abv = v_col.y, fire = v_col.z;
         if (col > 0.02) {
           float r = vn(v_rxy / 2.5) * 0.6 + vn(v_rxy / 0.7) * 0.4;
           vec3 rub = mix(vec3(0.34, 0.31, 0.28), vec3(0.17, 0.15, 0.13), r) * mix(1.0, 0.5, fire);
-          material.diffuse = mix(material.diffuse, rub * tint, smoothstep(0.25, 0.7, col) * smoothstep(0.5, 2.5, abv) * 0.9);
+          material.diffuse = mix(material.diffuse, rub * tint, smoothstep(0.25, 0.7, col) * smoothstep(0.5, 2.5, abv) * 0.9 * (1.0 - smoothstep(4.0, 20.0, px)));
         }
         material.diffuse *= 1.0 - 0.45 * fire * smoothstep(3.0, 10.0, abv) * (1.0 - smoothstep(0.1, 0.4, col));
+        // cracks: a broken Voronoi web (~60 m and ~8 m cells) plus the blast's radial and concentric cracks.
+        // Dark core, wider inner shadow, glowing while hot. Ground and rubble only: never on walls or standing roofs.
+        if (ck.x > 0.01) {
+          float level = smoothstep(0.55, 0.85, abs(dot(nEC, ckUp)));
+          float grd = clamp((1.0 - smoothstep(1.0, 4.0, abv)) + smoothstep(0.4, 0.8, col), 0.0, 1.0);
+          float I = ck.x, k = I * level * grd;
+          if (k > 0.01) {
+            float e1 = vorEdge(ckXY / 60.0) * 60.0, w1 = mix(0.15, 1.1, I) * step(1.0 - 0.45 * I, vn(ckXY / 140.0 + 5.1));
+            float e2 = vorEdge(ckXY / 8.0 + 7.3) * 8.0, w2 = 0.18 * smoothstep(0.45, 0.85, I) * step(0.45, vn(ckXY / 25.0 + 2.2));
+            float core = max(max(crackLine(e1, w1, px), crackLine(e2, w2, px)), max(fissure(ck2.x, ck.z, px), fissure(ck2.y, ck.w, px)));
+            float halo = max(max(crackLine(e1, w1 * 2.0, px), crackLine(e2, w2 * 2.0, px)), max(crackLine(ck2.x, ck.z * 2.2, px), crackLine(ck2.y, ck.w * 2.2, px)));
+            material.diffuse *= 1.0 - 0.5 * halo * k;
+            material.diffuse = mix(material.diffuse, vec3(0.012, 0.01, 0.009), core * k);
+            material.diffuse += vec3(1.0, 0.36, 0.07) * pow(ck.y, 1.5) * k * (1.4 * core + 0.2 * halo); // the glow fades before the heat
+          }
+        }
       }`,
     });
   }
@@ -1407,7 +1468,8 @@ export class NukeEngine {
     D.warm = 0.6 * glow * (1 + night);
     D.burn = smooth(0, E.tmax, t); D.glowB = 1.6 * glow * (1 + 1.5 * night);
     D.crv = smooth(E.tmax * 0.5, E.tmax * 3 + 1, t);
-    const heat = Math.exp(-t / (8 * E.tglow)); D.heat = heat < 0.01 ? 0 : heat; // glowing crater floor (cracks too, later)
+    // glowing crater floor and cracks: cools in REAL time (sim time runs up to 12x faster), black after ~a minute
+    const heat = Math.min(1, smooth(0, 1.5, D.real) * 1.2) * Math.exp(-D.real / 20); D.heat = D.real > 2 && heat < 0.01 ? 0 : heat;
     this.setSlot(D.slot, D);
     if (D.groundMat) { const u = D.groundMat.uniforms; u.shock = D.shock / D.maxR; u.glow = Math.min(0.9, 1.2 * glow); u.burn = smooth(0, E.tmax * 2, t); u.crv = D.crv; }
     this.addRing(D, 'fb', E.Rfb, '#ffd84a');

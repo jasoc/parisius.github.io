@@ -52,6 +52,22 @@ Not checked: a hilly city or coast (Milan only), a moving-camera visual check fo
 - Not checked: a coast; leaning (the shear exists, too subtle to see at 1 km); the globe fallback for collapse
   (by design none).
 
+## Phase 3 notes (cracks)
+
+- **Google tiles are unlit and the unlit path ignores `material.emissive`.** Every glow (crater floor since
+  Phase 1, shock ring, cracks) is now added to `diffuse`. The Phase 1 crater-floor glow had never shown.
+- The crack web does not use a world-space frame (`mod(czm_model[3], P)`): czm_model is float32, ~0.5 m off,
+  which shows as seams at tile borders with 8 m cells. It uses the precise local frame of the strongest blast at
+  that pixel (seams only where two blasts' crack fields are equally strong).
+- Walls are excluded with a screen-space normal (`cross(dFdx, dFdy)` of positionEC, tiles have no normals) and the
+  collapse varyings. Derivatives are taken at the top of `fragmentMain`, in uniform control flow.
+- Major fissures keep ≥ ~1 px width (dimmed by coverage) so they read from 50 km; the web fades below a pixel.
+- Collapse fades out 12-25 km from the camera: squashing coarse LOD tiles opened rectangular seams against finer
+  neighbours (seen at 50 km).
+- Heat is real-time (`exp(-real/20)`, sim time runs up to 12x faster): verified Castle Bravo over Milan, glowing
+  at 8 s, faint at 35 s, black cracks at 65 s; reads at 500 m (wide fissures + web across the rubble) and 50 km
+  (radial + concentric fissure pattern).
+
 Goal: when a bomb goes off, the world is physically changed. Real craters, buildings that collapse as
 the shock front passes, ground cracks, flying debris, and cumulative damage that lets Tsar-spam sink
 and crack a whole continent. Everything persists until `clear()`.
