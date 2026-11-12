@@ -1347,7 +1347,7 @@ export class NukeEngine {
       case 'duck': return this.dropDuck(p);
       case 'ufo': return this.spawnUfo(p);
       case 'asteroid': case 'rod': return this.launchMode ? this.detonate(p, w) : this.fireFromSky(p, w);
-      case 'cruise': return this.launchMode ? this.smallBoom(p, 2.2) : this.fireCruise(p, w);
+      case 'cruise': return this.launchMode ? this.smallBoom(p, 2.2 * Math.cbrt(w.W / 0.00045)) : this.fireCruise(p, w);
       case 'railgun': return this.placeTurret(p);
       default: return this.detonate(p, w);
     }
@@ -2068,7 +2068,7 @@ export class NukeEngine {
     this.launchFlyer({
       path, dur, headPixels: 12, headColor: new Cesium.Color(1, 0.85, 0.55, 1),
       trail: { size: Math.max(40, Math.min(3000, dist * 0.004)), life: 2.5, c0: [1, 0.95, 0.85], c1: [0.8, 0.8, 0.8], every: 0.03, a0: 0.4 },
-      onArrive: () => { this.smallBoom(target, 2.2); this.ev.unlock('cruise'); },
+      onArrive: () => { this.smallBoom(target, 2.2 * Math.cbrt(w.W / 0.00045)); this.ev.unlock('cruise'); },
     });
   }
 
