@@ -164,6 +164,26 @@ function craterZ(d, E, crv) {
   const peak = big * 0.18 * Dp * Math.exp(-((r / 0.12) ** 2));
   return (bowl + rim + ej + peak) * crv;
 }
+/** least-squares plane h = a + b x + c y through points {x, y, h} */
+function fitPlane(P) {
+  let n = 0, sx = 0, sy = 0, sh = 0, sxx = 0, syy = 0, sxy = 0, sxh = 0, syh = 0;
+  for (const p of P) { n++; sx += p.x; sy += p.y; sh += p.h; sxx += p.x * p.x; syy += p.y * p.y; sxy += p.x * p.y; sxh += p.x * p.h; syh += p.y * p.h; }
+  const A = [[n, sx, sy], [sx, sxx, sxy], [sy, sxy, syy]], B = [sh, sxh, syh];
+  const det = (m) => m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+  const d = det(A); if (Math.abs(d) < 1e-9) return [sh / Math.max(n, 1), 0, 0];
+  return [0, 1, 2].map((k) => det(A.map((row, r) => row.map((v, c) => (c === k ? B[r] : v)))) / d);
+}
+/** plane under the low points (streets, not roofs): fit, drop what lies above, refit */
+function lowerEnvelope(P) {
+  let pts = P, pl = null;
+  for (let it = 0; it < 5 && pts.length >= 4; it++) { pl = fitPlane(pts); const k = pl; const next = pts.filter((q) => q.h <= k[0] + k[1] * q.x + k[2] * q.y + 1.5); if (next.length < 4 || next.length === pts.length) break; pts = next; }
+  return pl;
+}
+/** separable N x N filter of radius r: op = Math.min (erosion), Math.max (dilation) or null (box blur) */
+function filt2(src, N, r, op) {
+  const pass = (a, sx, sy) => { const o = new Float32Array(N * N); for (let j = 0; j < N; j++) for (let i = 0; i < N; i++) { let acc = op ? (op === Math.min ? Infinity : -Infinity) : 0, n = 0; for (let k = -r; k <= r; k++) { const ii = i + k * sx, jj = j + k * sy; if (ii < 0 || jj < 0 || ii >= N || jj >= N) continue; const v = a[jj * N + ii]; if (op) acc = op(acc, v); else acc += v; n++; } o[j * N + i] = op ? acc : acc / n; } return o; };
+  return pass(pass(src, 1, 0), 0, 1);
+}
 const GLSL_COMMON = `
   float h21(vec2 p) { p = fract(p * vec2(123.34, 456.21)); p += dot(p, p + 45.32); return fract(p.x * p.y); }
   float vn(vec2 p) {
@@ -189,6 +209,50 @@ const GLSL_COMMON = `
     float n = (vn(q * 3.0) - 0.5) + 0.4 * (vn(q * 11.0) - 0.5);
     float lump = 0.12 * Dp * n * (1.0 - smoothstep(1.3, 2.5, r)) * smoothstep(0.0, 0.5, r + big);
     return (bowl + rim + ej + peak + lump) * crv;
+  }
+  // bare-earth height (m, relative to the blast origin) from the 4x4 atlas of 64x64 per-blast heightmaps;
+  // float textures are not linearly filterable everywhere: NEAREST + manual bilinear
+  float hmFetch(int k, ivec2 g) { g = clamp(g, ivec2(0), ivec2(63)); return texelFetch(u_hm, ivec2((k % 4) * 64, (k / 4) * 64) + g, 0).r; }
+  float bareEarth(vec2 xy, float idx, float S) {
+    vec2 g = clamp((xy / S * 0.5 + 0.5) * 63.0, 0.0, 63.0);
+    vec2 f = fract(g); ivec2 i = ivec2(floor(g)); int k = int(idx);
+    return mix(mix(hmFetch(k, i), hmFetch(k, i + ivec2(1, 0)), f.x), mix(hmFetch(k, i + ivec2(0, 1)), hmFetch(k, i + ivec2(1, 1)), f.x), f.y);
+  }
+`;
+// Building collapse for one blast (vertex stage). Buildings are told from terrain only by their height above
+// the bare-earth estimate. Per 35 m "block": inside r20 everything pancakes, in the 5 psi band some blocks
+// pancake and the others stand at 60-100 % leaning away from the blast. Falls as the shock front passes.
+// best = (weight, original height above ground, in fire zone, -); the strongest blast wins.
+const GLSL_COLLAPSE = `
+  void cfx(vec3 pEC, mat4 M, vec4 a, vec4 b, vec4 dd, vec4 e, inout vec4 best, inout vec3 bestEC, inout vec2 bestXY) {
+    if (a.y <= 0.0 || e.x < 0.0) return;
+    vec3 l = (M * vec4(pEC, 1.0)).xyz;
+    float d = length(l.xy);
+    if (d > a.z || d > e.y) return;
+    float h = l.z + d * d / (2.0 * 6371000.0);
+    float above = h - bareEarth(l.xy, e.x, e.y) - 3.0; // the estimate runs a few metres low: spare the streets
+    if (above <= 0.0) return;
+    float terrain = 1.0 - smoothstep(250.0, 400.0, above); // hundreds of metres "above ground" is a hill, not a tower
+    float s = 1.0 - smoothstep(a.y, a.z, d);
+    // "blocks" are smooth ~35 m noise cells, not a hard hash: a building split between two cells would otherwise
+    // keep one half standing and drag the other down into a stretched curtain
+    vec2 q = l.xy / 35.0 + dd.w;
+    float nb = vn(q), nb2 = vn(q + 17.3), nb3 = vn(q * 0.6 + 41.7);
+    float Lt = max(60.0, 0.25 * a.y);
+    float prog = smoothstep(0.0, Lt, e.z - d - nb3 * Lt * 0.6) * terrain; // e.z: the front as far as collapse knows
+    if (prog <= 0.0) return;
+    float Rfb = max((b.w - e.w) / 3.0, 1.0);
+    float vap = e.w < Rfb ? 1.0 - smoothstep(0.5 * Rfb, 0.65 * Rfb, d) : 0.0; // vaporised: nothing left, no rubble
+    float down = max(vap, smoothstep(-0.07, 0.07, s * 1.1 - 0.05 - nb));      // pancaked (s = 1 inside r20: all of it)
+    float keep = mix(mix(1.0, 0.6, s * nb2), mix(0.06, 0.18, nb2), down) * (1.0 - vap);
+    float w = (1.0 - keep) * prog;
+    if (w <= best.x) return;
+    float rub = (1.0 - vap) * vn(l.xy / 7.0 + dd.w) * min(0.15 * above, 4.0);
+    float dz = (above * keep + rub * (1.0 - keep) - above) * prog;
+    vec2 lean = normalize(l.xy + 0.001) * above * s * 0.12 * nb2 * prog * (1.0 - down); // away from the blast
+    best = vec4(w, above, d < b.x ? 1.0 : 0.0, 0.0);
+    bestEC = transpose(mat3(M)) * vec3(lean, dz);
+    bestXY = l.xy;
   }
 `;
 
@@ -290,7 +354,8 @@ export class NukeEngine {
   private needsFrames() {
     return this.blasts.some((D) => D.t < D.E.Trise * 3 || !D.heard) || this.flyers.length > 0 || this.particles.length > 0 ||
       this.bombs.length > 0 || this.planes.length > 0 || this.turrets.length > 0 || this.ufos.length > 0 || this.ducks.some((d) => !d.rest) ||
-      this.shake.amp > 0 || this.keys.size > 0 || this.recentering || this.zoomPending !== 0 || this.FLASH > 0.001;
+      this.shake.amp > 0 || this.keys.size > 0 || this.recentering || this.zoomPending !== 0 || this.FLASH > 0.001 ||
+      this.jobs.length > 0 || this.atlasDirty || (this.armed && this.hoverRest && !this.hoverRest.done);
   }
   private poke() { this.scene?.requestRender(); }
 
@@ -326,8 +391,9 @@ export class NukeEngine {
   /** how far a blast can move geometry: { reach (m from ground zero), down (m), side (m) }; see installCullPad */
   private padOf(D) {
     const E = D.E, R = E.crater, Dp = Math.min(0.4 * R, 30000), dish = dishDepth(E);
-    if (R > 0) return { reach: 2.5 * R, down: Dp * 1.1, side: 0.15 * Dp + 5 };
-    return { reach: E.Rfb, down: dish, side: 0 };
+    const p = R > 0 ? { reach: 2.5 * R, down: Dp * 1.1, side: 0.15 * Dp + 5 } : { reach: E.Rfb, down: dish, side: 0 };
+    if (D.hm) { p.reach = Math.max(p.reach, E.r5); p.side = Math.max(p.side, 40); } // leaning blocks
+    return p;
   }
   padTile(tile) {
     if (tile.__pg === this.padGen) return;
@@ -368,15 +434,173 @@ export class NukeEngine {
   }
   /** Height of the (deformed) surface: the single choke point for everything that stands on the ground. */
   surfaceHeight(carto) {
-    let h; try { h = this.scene.sampleHeight(carto); } catch {}
+    let h = this.sampleH(carto);
     if (h === undefined) return undefined;
-    return h + this.deformAt(Cesium.Cartographic.toCartesian(new Cesium.Cartographic(carto.longitude, carto.latitude, h)));
+    const P = Cesium.Cartographic.toCartesian(new Cesium.Cartographic(carto.longitude, carto.latitude, h));
+    // inside a collapsed zone the roofs are gone: smooth mirror of the shader (no per-block dice)
+    for (const D of this.blasts) {
+      if (!D.hm) continue;
+      const E = D.E, l = Cesium.Matrix4.multiplyByPoint(D.invEnu, P, new Cesium.Cartesian3()), d = Math.hypot(l.x, l.y);
+      if (d > E.r5 || d > D.hmS) continue;
+      const g = this.hmAt(D, l.x, l.y) + D.h0 + 3, above = h - g;
+      if (above <= 0 || above > 400) continue;
+      const prog = smooth(0, Math.max(60, 0.25 * E.r20), D.cshock - d), s = 1 - smooth(E.r20, E.r5, d);
+      h = g + above * (1 - 0.88 * s * prog);
+    }
+    return h + this.deformAt(P);
+  }
+
+  // ---- bare-earth heightmaps (one 64x64 grid per blast, packed in a 4x4 float atlas, tile = shader slot) ----
+  private atlas = new Float32Array(256 * 256 * 4); private atlasDirty = false; private lastAtlas = 0;
+  private terrainP = null; private jobs = [];
+  private atlasUniform() {
+    const F = Cesium.TextureMinificationFilter.NEAREST, G = Cesium.TextureMagnificationFilter.NEAREST;
+    return new Cesium.TextureUniform({ typedArray: this.atlas, width: 256, height: 256, pixelFormat: Cesium.PixelFormat.RGBA, pixelDatatype: Cesium.PixelDatatype.FLOAT, minificationFilter: F, magnificationFilter: G });
+  }
+  /** sampleHeight costs ~10 ms (an offscreen pick): CPU work like that goes through this queue, ≤ 8 ms per frame */
+  private runJobs() {
+    const t0 = performance.now();
+    if (this.jobs.length) { const restore = this.hideForSampling(); try { while (this.jobs.length && performance.now() - t0 < 8) { if (this.jobs[0]()) this.jobs.shift(); } } finally { restore(); } }
+    if (this.atlasDirty && performance.now() - this.lastAtlas > 250) {
+      this.atlasDirty = false; this.lastAtlas = performance.now();
+      this.bShader.setUniform('u_hm', this.atlasUniform());
+    }
+  }
+  /** height of the 3D tiles only: plain sampleHeight also hits clouds, billboards and models (8 km "ground") */
+  //  (objectsToExclude does not work for billboards: the pick reports the billboard, not its collection, so
+  //  everything that is not the tileset is hidden for the duration; no frame is drawn in between)
+  private sampleH(carto) {
+    const restore = this.hideForSampling();
+    try { return this.scene.sampleHeight(carto, this.viewer.entities.values); } catch { return undefined; } finally { restore(); }
+  }
+  private hiding = false;
+  private hideForSampling() {
+    if (this.hiding) return () => {};
+    const P = this.scene.primitives, off = [];
+    for (let i = 0; i < P.length; i++) { const q = P.get(i); if (q !== this.tileset && q.show) { q.show = false; off.push(q); } }
+    this.hiding = true;
+    return () => { off.forEach((q) => (q.show = true)); this.hiding = false; };
+  }
+  /**
+   * Bare-earth estimate around a blast, async (never blocks the blast): Cesium World Terrain on a 64x64 grid over
+   * ±S, opened to drop the buildings it carries, then shifted onto the Google streets (calP). Fallbacks:
+   * a plane through the lowest Google samples, then a flat plane. Heights are relative to the origin.
+   * It takes ~2-4 s (sampleHeight is ~10 ms a call), longer than the shock needs to cross a small bomb's r5, so it
+   * is PREPARED ahead when possible: while the armed cursor rests, when a missile is fired, for chain-reaction sites.
+   */
+  private preps = [];
+  private hmSize(E) { return Math.min(30000, Math.max(300, 1.1 * E.r5)); }
+  prepHeightmap(origin, S) {
+    if (!this.tileset) return null;
+    const C3 = Cesium.Cartesian3, N = 64;
+    const near = this.preps.find((q) => !q.dead && q.S >= S * 0.9 && q.S <= S * 2 && C3.distance(q.origin, origin) < 0.03 * S);
+    if (near) return near;
+    const enu = Cesium.Transforms.eastNorthUpToFixedFrame(origin), oc = Cesium.Cartographic.fromCartesian(origin), h0 = oc.height;
+    const Q: any = { origin: C3.clone(origin), S, h0, ready: false, waiters: [], dead: false };
+    const cartoAt = (x, y) => Cesium.Cartographic.fromCartesian(Cesium.Matrix4.multiplyByPoint(enu, new C3(x, y, 0), new C3()));
+    /** Google heights (relative to h0) at blast-local points, through the frame-budgeted job queue */
+    const sample = (pts) => new Promise((resolve) => {
+      const out = pts.map(() => null); let k = 0;
+      this.jobs.push(() => {
+        if (Q.dead) { resolve(out); return true; }
+        const [x, y] = pts[k]; const h = this.sampleH(cartoAt(x, y)); if (h !== undefined) out[k] = { x, y, h: h - h0 };
+        if (++k >= pts.length) { resolve(out); return true; }
+        return false;
+      });
+    });
+    const grid = []; for (let j = 0; j < N; j++) for (let i = 0; i < N; i++) grid.push(cartoAt(-S + (2 * S * i) / (N - 1), -S + (2 * S * j) / (N - 1)));
+    const level = Math.max(0, Math.min(13, Math.round(Math.log2((20037508 * Math.max(0.2, Math.cos(oc.latitude))) / (64 * ((2 * S) / (N - 1)))))));
+    // World Terrain is NOT bare earth in cities: it carries smoothed buildings (central Milan: +6..31 m over the
+    // streets). A morphological opening (~250 m) drops blocks but keeps slopes; a light blur smooths the steps.
+    Q.dtmP = (this.terrainP ||= Cesium.createWorldTerrainAsync().catch(() => null))
+      .then((tp) => (tp && !Q.dead ? Cesium.sampleTerrain(tp, level, grid) : null))
+      .then((res) => {
+        if (!res || !res.every((c) => Number.isFinite(c.height))) return null;
+        const kr = Math.max(1, Math.min(6, Math.round(250 / ((2 * S) / (N - 1)))));
+        return filt2(filt2(filt2(Float32Array.from(res, (c) => c.height - h0), N, kr, Math.min), N, kr, Math.max), N, Math.max(1, kr >> 1), null);
+      })
+      .catch(() => null);
+    const at = (dtm, x, y) => { const gx = Math.max(0, Math.min(N - 1.001, ((x / S) * 0.5 + 0.5) * (N - 1))), gy = Math.max(0, Math.min(N - 1.001, ((y / S) * 0.5 + 0.5) * (N - 1))); const i = Math.floor(gx), j = Math.floor(gy), fx = gx - i, fy = gy - j, g = (a, b) => dtm[b * N + a]; return lerp(lerp(g(i, j), g(i + 1, j), fx), lerp(g(i, j + 1), g(i + 1, j + 1), fx), fy); };
+    // Google - terrain is a regional offset: a prep within ~5 km of another reuses its calibration (no sampling)
+    const donor = this.preps.find((q) => !q.dead && q.calP && C3.distance(q.origin, origin) < Math.max(5000, 2 * S));
+    if (donor) Q.calP = donor.calP;
+    else {
+      // 12 clusters of 4 Google samples within ~30 m: the lowest of each is most likely a street or courtyard
+      const pts = [];
+      for (let k = 0; k < 12; k++) { const r = 0.7 * S * Math.sqrt((k + 0.5) / 12), a = k * 2.39996; for (let m = 0; m < 4; m++) { const b = Math.random() * 6.283, q = 30 * Math.sqrt(Math.random()); pts.push([r * Math.cos(a) + q * Math.cos(b), r * Math.sin(a) + q * Math.sin(b)]); } }
+      Q.calP = Promise.all([Q.dtmP, sample(pts)]).then(([dtm, got]) => {
+        if (!dtm) return null;
+        // one robust offset: the median over clusters of (lowest sample - terrain). A fitted plane chased the
+        // lowest points (a harbour) and tilted the ground under the hills (Genoa: slopes 15-46 m too low)
+        const res = [];
+        for (let k = 0; k < 12; k++) { const cl = got.slice(k * 4, k * 4 + 4).filter(Boolean); if (cl.length) { const lo = cl.reduce((a, b) => (b.h < a.h ? b : a)); res.push(lo.h - at(dtm, lo.x, lo.y)); } }
+        res.sort((a, b) => a - b);
+        if (res.length < 3) return null;
+        // where the terrain is unreliable (residuals spread wide: ±25 m in Genoa) lift the estimate, so hillsides
+        // it gets wrong are not flattened as if they were buildings; only the upper floors fall there
+        const iqr = res.length >= 4 ? res[Math.floor(res.length * 0.75)] - res[Math.floor(res.length * 0.25)] : 0;
+        return { off: res[res.length >> 1], margin: Math.min(12, 0.75 * iqr), res };
+      });
+    }
+    Promise.all([Q.dtmP, Q.calP]).then(async ([dtm, cal]) => {
+      if (Q.dead) return;
+      const hm = new Float32Array(N * N);
+      if (dtm) {
+        const c = cal || { off: 0, margin: 8 };
+        for (let k = 0; k < N * N; k++) hm[k] = dtm[k] + c.off + c.margin;
+        Q.src = cal ? 'terrain' : 'terrain-uncal'; Q.res = c.res; Q.margin = c.margin;
+      } else {
+        // no terrain: lower envelope of a 7x7 net of Google samples, else flat
+        const net = []; for (let j = 0; j < 7; j++) for (let i = 0; i < 7; i++) net.push([S * 0.85 * (i / 3 - 1), S * 0.85 * (j / 3 - 1)]);
+        const pl = lowerEnvelope((await sample(net)).filter(Boolean));
+        for (let j = 0; j < N; j++) for (let i = 0; i < N; i++) { const x = -S + (2 * S * i) / (N - 1), y = -S + (2 * S * j) / (N - 1); hm[j * N + i] = pl ? pl[0] + pl[1] * x + pl[2] * y : 0; }
+        Q.src = pl ? 'plane' : 'flat';
+      }
+      Q.hm = hm; Q.ready = true;
+      Q.waiters.forEach((D) => !D.dead && this.applyPrep(D, Q)); Q.waiters = [];
+    });
+    this.preps.push(Q);
+    // keep a few finished ones for reuse (in-progress ones always stay: a blast may be about to wait on them)
+    while (this.preps.filter((q) => q.ready).length > 4) this.preps.splice(this.preps.findIndex((q) => q.ready), 1);
+    return Q;
+  }
+  /** prepare for a weapon about to hit `pos` (hover, missile in flight, chain site) */
+  private prepFor(pos, w) {
+    if (!this.tileset || !pos || !(w.W > 0) || !['nuke', 'asteroid', 'rod', 'icbm'].includes(w.kind)) return;
+    this.prepHeightmap(pos, this.hmSize(effects(w.W, w.air, w.hob)));
+  }
+  private startHeightmap(D) {
+    if (!this.tileset) return;
+    D.hmS = this.hmSize(D.E); D.hm = null;
+    const Q = this.prepHeightmap(D.origin, D.hmS);
+    if (!Q) return;
+    D.hmS = Q.S; D.prep = Q;
+    if (Q.ready) this.applyPrep(D, Q); else Q.waiters.push(D);
+  }
+  /** a blast takes a prepared heightmap (its origin may sit a little off and higher or lower: re-reference it) */
+  private applyPrep(D, Q) {
+    const h0 = Cesium.Cartographic.fromCartesian(D.origin).height, dz = Q.h0 - h0;
+    D.hm = dz ? Q.hm.map((v) => v + dz) : Q.hm; D.h0 = h0; D.hmS = Q.S;
+    D.hmSrc = Q.src; D.hmRes = Q.res; D.hmMargin = Q.margin;
+    this.writeAtlas(D);
+  }
+  private writeAtlas(D) {
+    if (!D.hm) return;
+    const tx = D.slot % 4, ty = Math.floor(D.slot / 4);
+    for (let j = 0; j < 64; j++) for (let i = 0; i < 64; i++) this.atlas[((ty * 64 + j) * 256 + tx * 64 + i) * 4] = D.hm[j * 64 + i];
+    this.atlasDirty = true; this.padGen++; this.poke();
+  }
+  /** CPU bilinear of a blast's heightmap at blast-local x, y (m, relative to the origin) */
+  private hmAt(D, x, y) {
+    const N = 64, S = D.hmS, gx = Math.max(0, Math.min(N - 1.001, ((x / S) * 0.5 + 0.5) * (N - 1))), gy = Math.max(0, Math.min(N - 1.001, ((y / S) * 0.5 + 0.5) * (N - 1)));
+    const i = Math.floor(gx), j = Math.floor(gy), fx = gx - i, fy = gy - j, g = (a, b) => D.hm[b * N + a];
+    return lerp(lerp(g(i, j), g(i + 1, j), fx), lerp(g(i, j + 1), g(i + 1, j + 1), fx), fy);
   }
 
   private MAX = 16;
   private setupShader() {
     const U = Cesium.UniformType, uniforms = {};
-    let calls = '', vcalls = '';
+    let calls = '', vcalls = '', ccalls = '';
     for (let i = 0; i < this.MAX; i++) {
       // u_m = inverse(blast ENU) * inverse(view), built in doubles every frame: eye coords -> blast-local metres,
       // precise near the blast (float32 world coords are only good to ~0.5 m)
@@ -387,11 +611,14 @@ export class NukeEngine {
       uniforms['u_e' + i] = { type: U.VEC4, value: new Cesium.Cartesian4() }; // atlas idx, atlas half-extent, collapse, hob
       calls += `fx(pEC, u_m${i}, u_a${i}, u_b${i}, u_d${i}, u_e${i}, tint, material);\n`;
       vcalls += `dEC += vfx(pEC, u_m${i}, u_a${i}, u_b${i}, u_d${i}, u_e${i});\n`;
+      ccalls += `cfx(pEC, u_m${i}, u_a${i}, u_b${i}, u_d${i}, u_e${i}, best, bestEC, bestXY);\n`;
     }
+    uniforms.u_hm = { type: U.SAMPLER_2D, value: this.atlasUniform() };
     uniforms.u_rings = { type: U.FLOAT, value: this.showRings ? 1 : 0 };
     this.bShader = new Cesium.CustomShader({
       uniforms,
-      vertexShaderText: GLSL_COMMON + `
+      varyings: { v_col: Cesium.VaryingType.VEC4, v_rxy: Cesium.VaryingType.VEC2 },
+      vertexShaderText: GLSL_COMMON + GLSL_COLLAPSE + `
       // displacement of one blast, in eye coordinates (summed over blasts, then taken back to model space)
       vec3 vfx(vec3 pEC, mat4 M, vec4 a, vec4 b, vec4 dd, vec4 e) {
         if (a.y <= 0.0 || dd.y <= 0.0) return vec3(0.0);
@@ -406,7 +633,10 @@ export class NukeEngine {
         // overlapping craters add up; never deeper than ~60 km
         float L = length(dEC);
         if (L > 60000.0) dEC *= 60000.0 / L;
-        vsOutput.positionMC += mat3(czm_inverseModelView) * dEC;
+        vec4 best = vec4(0.0); vec3 bestEC = vec3(0.0); vec2 bestXY = vec2(0.0);
+        ${ccalls}
+        v_col = best; v_rxy = bestXY;
+        vsOutput.positionMC += mat3(czm_inverseModelView) * (dEC + bestEC);
       }`,
       fragmentShaderText: GLSL_COMMON + `
       void fx(vec3 pEC, mat4 M, vec4 a, vec4 b, vec4 dd, vec4 e, vec3 tint, inout czm_modelMaterial m) {
@@ -457,6 +687,14 @@ export class NukeEngine {
         vec3 tint = mix(vec3(0.09, 0.12, 0.21), vec3(1.0), day) * mix(vec3(1.0), vec3(1.14, 0.86, 0.66), golden);
         material.diffuse *= tint;
         ${calls}
+        // collapsed buildings: the stretched photo turns into rubble (burnt in the fire zone); soot on standing walls
+        float col = v_col.x, abv = v_col.y, fire = v_col.z;
+        if (col > 0.02) {
+          float r = vn(v_rxy / 2.5) * 0.6 + vn(v_rxy / 0.7) * 0.4;
+          vec3 rub = mix(vec3(0.34, 0.31, 0.28), vec3(0.17, 0.15, 0.13), r) * mix(1.0, 0.5, fire);
+          material.diffuse = mix(material.diffuse, rub * tint, smoothstep(0.25, 0.7, col) * smoothstep(0.5, 2.5, abv) * 0.9);
+        }
+        material.diffuse *= 1.0 - 0.45 * fire * smoothstep(3.0, 10.0, abv) * (1.0 - smoothstep(0.1, 0.4, col));
       }`,
     });
   }
@@ -658,9 +896,20 @@ export class NukeEngine {
     }
     // never below the (deformed) surface: tile collision only knows the original geometry, the ellipsoid even less
     const pc = Cesium.Cartographic.fromCartesian(pos);
-    const floor = (this.surfaceHeight(pc) ?? this.deformAt(Cesium.Cartographic.toCartesian(new Cesium.Cartographic(pc.longitude, pc.latitude, 0)))) + 15;
+    const floor = this.floorAt(pc);
     if (pc.height < floor) { this.zoomPending = 0; return; }
     cam.setView({ destination: pos, orientation: { heading: cam.heading, pitch: cam.pitch, roll: cam.roll } });
+  }
+
+  /** camera floor: surfaceHeight + 15 m, cached (sampleHeight costs ~10 ms, zoom runs every frame) */
+  private floorC = null;
+  private floorAt(pc) {
+    const f = this.floorC, now = performance.now();
+    if (f && now - f.t < 400 && Math.abs(f.lon - pc.longitude) < 2e-5 && Math.abs(f.lat - pc.latitude) < 2e-5) return f.h;
+    if (pc.height > 3000 + (f ? f.h : 0)) return -Infinity; // far above anything: no need to look
+    const h = (this.surfaceHeight(pc) ?? this.deformAt(Cesium.Cartographic.toCartesian(new Cesium.Cartographic(pc.longitude, pc.latitude, 0)))) + 15;
+    this.floorC = { t: now, lon: pc.longitude, lat: pc.latitude, h };
+    return h;
   }
 
   private handleKeys(dt) {
@@ -738,6 +987,8 @@ export class NukeEngine {
 
   clear() {
     [...this.blasts].forEach((D) => this.removeBlast(D));
+    this.jobs = []; this.atlas.fill(0); this.atlasDirty = true;
+    this.preps.forEach((q) => (q.dead = true)); this.preps = [];
     this.flyers.forEach((f) => { this.rm(f.head); f.entity && this.viewer.entities.remove(f.entity); }); this.flyers = [];
     this.particles.forEach((p) => this.rm(p.b)); this.particles = [];
     this.ducks.forEach((d) => { d.model && this.scene.primitives.remove(d.model); d.bb && this.rm(d.bb); }); this.ducks = [];
@@ -927,9 +1178,10 @@ export class NukeEngine {
     s.setUniform('u_a' + slot, D ? new Cesium.Cartesian4(D.shock, D.E.r20, D.E.r5, D.E.r1) : new Cesium.Cartesian4());
     s.setUniform('u_b' + slot, D ? new Cesium.Cartesian4(D.E.rth, D.burn, D.glowB, D.E.Rfb * 3 + D.E.hob) : new Cesium.Cartesian4(0, 0, 0, 1));
     s.setUniform('u_d' + slot, D ? new Cesium.Cartesian4(D.E.crater, D.crv, D.heat, D.seed) : new Cesium.Cartesian4());
-    s.setUniform('u_e' + slot, D ? new Cesium.Cartesian4(-1, 0, 0, D.E.hob) : new Cesium.Cartesian4());
+    s.setUniform('u_e' + slot, D ? new Cesium.Cartesian4(D.hm ? D.slot : -1, D.hmS || 0, D.cshock, D.E.hob) : new Cesium.Cartesian4(-1, 0, 0, 0));
   }
   private removeBlast(D) {
+    D.dead = true;
     if (D.ground) this.scene.primitives.remove(D.ground);
     D.entities.forEach((e) => this.viewer.entities.remove(e));
     this.setSlot(D.slot, null);
@@ -944,6 +1196,7 @@ export class NukeEngine {
     add('shock', 110);
     if (E.air && E.hob > 0) add('wilson', 80, () => ({ el: Math.pow(R(), 0.7) * 1.3 - 0.15 }));
     if (!E.air) add('dust', 100);
+    if (this.tileset) add('rubble', 150); // dust kicked up by collapsing buildings, then a haze over the ruins
     return P;
   }
 
@@ -968,7 +1221,7 @@ export class NukeEngine {
     const sunk = this.deformAt(groundPos);
     D.origin = C3.add(groundPos, C3.multiplyByScalar(D.up, -sunk, new C3()), new C3());
     D.invEnu = Cesium.Matrix4.inverseTransformation(Cesium.Transforms.eastNorthUpToFixedFrame(D.origin), new Cesium.Matrix4());
-    D.crv = 0; D.heat = 1; D.seed = Math.random() * 97;
+    D.crv = 0; D.heat = 1; D.seed = Math.random() * 97; D.cshock = 0;
     D.maxR = E.r1 * 1.15;
     // the ground decal is only needed on the globe fallback: on the 3D tiles the tile shader draws all of it
     if (!this.tileset) D.groundMat = new Cesium.Material({
@@ -1000,10 +1253,12 @@ export class NukeEngine {
     }));
     this.blasts.push(D); this.padGen++;
     this.setSlot(slot, D);
+    this.startHeightmap(D);
 
     if (this.chain && gen < 2) {
       for (let i = 0, n = gen === 0 ? 3 : 2; i < n; i++)
         D.children.push({ dist: E.r5 * (1.3 + Math.random() * 1.4), a: Math.random() * Math.PI * 2, W: w.W * (0.35 + Math.random() * 0.3) });
+      for (const ch of D.children) this.prepFor(D.local(ch.dist * Math.cos(ch.a), ch.dist * Math.sin(ch.a), 0), { ...w, W: ch.W });
     }
 
     const s = this.stats;
@@ -1102,6 +1357,14 @@ export class NukeEngine {
         z = p.r2 * hgt; size = hgt * 2.2 + r * 0.04; shade = 0.85;
         base = [0.74 * tn[0], 0.66 * tn[1], 0.56 * tn[2]];
         alpha = 0.3 * (1 - smooth(E.r20, E.r1, D.shock));
+      } else if (p.type === 'rubble') {
+        const R = E.Rfb + (E.r5 - E.Rfb) * Math.sqrt(p.r1);
+        if (D.shock < R) continue;
+        const wall = smooth(R, R + 0.12 * E.r5, D.shock), hz = 30 + 0.02 * E.r5;
+        x = R * Math.cos(p.th); y = R * Math.sin(p.th); z = p.r2 * hz * (1 + wall);
+        size = Math.max(60, 0.07 * E.r5) * (0.7 + 0.6 * p.r3) * (1 + 0.8 * wall); shade = 0.92;
+        base = [0.66 * tn[0], 0.6 * tn[1], 0.53 * tn[2]];
+        alpha = 0.26 * wall * (1 - 0.45 * smooth(0, 1, (D.shock - R) / (0.6 * E.r5))) * (1 - smooth(E.Trise * 0.8, E.Trise * 2.6, t)) * (1 - 0.6 * smooth(E.r20, E.r5, R));
       } else if (p.type === 'wilson') {
         const tw = t - E.tmax * 0.6;
         if (tw < 0 || tw > E.tmax * 4 + 2.5) continue;
@@ -1134,7 +1397,10 @@ export class NukeEngine {
     const dtSim = D.t > E.Trise * 3 ? 0 : dt * k;
     D.t += dtSim;
     const t = D.t;
+    const shock0 = D.shock;
     if (D.shock < D.maxR * 1.2) D.shock += 340 * E.shockBoost * (1 + (2.5 * E.Rfb) / Math.max(D.shock, E.Rfb)) * dtSim;
+    // collapse follows the front, but needs the bare-earth heightmap: if that lands late, it catches up in ~1.5 s
+    if (D.hm) D.cshock = Math.min(D.shock, D.cshock + Math.max(D.shock - shock0, (E.r5 / 1.5) * dt));
     D.dtSim = dtSim;
     const glow = Math.exp(-t / E.tglow), night = 1 - (D.tn ? D.tn.day : 1);
     D.flash = t < 0.04 ? 1 : 0.95 * Math.exp(-(t - 0.04) / (0.12 + 0.35 * E.tmax));
@@ -1239,6 +1505,7 @@ export class NukeEngine {
 
   // ---- from the sky ----
   private fireFromSky(groundPos, w) {
+    this.prepFor(groundPos, w);
     const C3 = Cesium.Cartesian3, E = effects(w.W, w.air, w.hob);
     const enu = Cesium.Transforms.eastNorthUpToFixedFrame(groundPos);
     const local = (x, y, z) => Cesium.Matrix4.multiplyByPoint(enu, new C3(x, y, z), new C3());
@@ -1314,6 +1581,7 @@ export class NukeEngine {
   }
   /** fire whatever is selected from the silo; the payload is delivered on impact */
   private launch(target, w) {
+    this.prepFor(target, w);
     const { path, dist } = this.ballistic(this.base.pos, target);
     const pts = []; for (let i = 0; i <= 120; i++) pts.push(path(i / 120));
     const entity = this.viewer.entities.add({ polyline: { positions: pts, width: 3, material: this.hiMat('#ffd23f', true), depthFailMaterial: this.hiMat('#ffd23f', true) } });
@@ -1569,7 +1837,7 @@ export class NukeEngine {
   }
 
   // ---- armed cursor preview: where it will hit and how far it reaches ----
-  private hover = null;
+  private hover = null; private hoverRest = null;
   private previewEnts = null;
   private previewRadii() {
     const w = this.tool;
@@ -1728,6 +1996,7 @@ export class NukeEngine {
     this.applyZoom(dt);
     this.recenter(dt);
     this.updateSun();
+    this.runJobs();
     // tile collision would stop the camera at the ORIGINAL surface, i.e. above a crater: off over sunk ground
     if (this.tileset) this.tileset.enableCollision = !(this.blasts.length && this.deformAt(this.camera.positionWC) < -10);
     const hd = Cesium.Math.toDegrees(this.camera.heading);
@@ -1736,6 +2005,12 @@ export class NukeEngine {
 
     this.updateFlyers(dt); this.updateBombs(dt); this.updateParticles(dt); this.updateDucks(dt); this.updateTurrets(dt); this.updateUfos(dt); this.updatePlanes(dt);
     if (this.hoverPx && this.armed) { const h = this.pickWorld(this.hoverPx); if (h) this.hover = h; this.hoverPx = null; }
+    // the cursor rests on a target: start its bare-earth heightmap now, the click will likely land there
+    if (this.armed && this.hover && this.tileset && !this.launchMode && !this.lineStart) {
+      const hv = this.hoverRest;
+      if (!hv || Cesium.Cartesian3.distance(hv.p, this.hover) > 25) this.hoverRest = { p: Cesium.Cartesian3.clone(this.hover), t: performance.now(), done: false };
+      else if (!hv.done && performance.now() - hv.t > 350) { hv.done = true; this.prepFor(hv.p, this.tool); }
+    }
     this.updatePreview();
 
     // every cloud of every blast goes into ONE collection, sorted far → near, so overlapping clouds blend correctly

@@ -26,6 +26,32 @@ Not checked: a hilly city or coast (Milan only), a moving-camera visual check fo
 - The camera floor is `surfaceHeight + 15 m` in `applyZoom`. Mouse-drag zoom/orbit does not test it.
 - Not checked: a hilly city, a coast, night.
 
+## Phase 2 notes (collapse)
+
+- **World Terrain is not bare earth in cities.** Central Milan: it sits 6-31 m above the Google streets, following the
+  blocks. A single calibration offset cannot fix that. Now: morphological opening of the 64x64 grid (~250 m min,
+  then max, then light blur), then ONE robust offset = median over 12 clusters of (lowest of 4 Google samples
+  within 30 m − terrain). A lower-envelope *plane* was tried first and tilted the ground under Genoa's hills
+  (slopes estimated 15-46 m low, hillsides flattened). Genoa residuals still spread ±25 m, so the estimate is
+  lifted by `0.75 × IQR` (≤ 12 m): where the data is unreliable only the upper floors fall. Hillsides inside r5
+  in Genoa still lose some height: a data limit, not fixable with tens of samples.
+- **`scene.sampleHeight` costs ~10 ms per call** and hit clouds/billboards (8 km "ground"); `objectsToExclude`
+  does not work for billboards (the pick reports the billboard, not the collection). `sampleH` hides every
+  non-tile primitive around each sampling batch. This also fixed chain-reaction / cruise target heights.
+- Heightmaps take 2-4 s, longer than the shock needs to cross a small bomb's r5. They are **prepared ahead**:
+  armed cursor resting 350 ms, missile/space launch, chain-reaction sites; calibration is shared within ~5 km
+  (16 Little Boys: all heightmaps in 4.8 s). If one still lands late, collapse catches up in ~1.5 s.
+- Per-"block" variation uses smooth 35 m value noise, not a hard hash: a building split between two hash cells
+  dragged one half down into a stretched curtain.
+- Verified (Chrome, Google tiles): Little Boy over central Milan flattens the 20 psi disc behind the ring, the
+  5 psi band mixes rubble and standing blocks with broken tops, streets keep their shape, no flicker or missing
+  tiles orbiting at 4 headings. Night: unchanged (very dark by design).
+- Frame time, 16 Little Boys, 1728x898, Radeon 760M: 23.5 fps with clouds animating; 38 fps with cloud updates
+  off; 41 fps with the custom shader also off → the whole tile shader costs ~3.6 ms. The rest is the
+  pre-existing CPU cloud simulation (+12 % from the new rubble dust puffs), which stops when the clouds settle.
+- Not checked: a coast; leaning (the shear exists, too subtle to see at 1 km); the globe fallback for collapse
+  (by design none).
+
 Goal: when a bomb goes off, the world is physically changed. Real craters, buildings that collapse as
 the shock front passes, ground cracks, flying debris, and cumulative damage that lets Tsar-spam sink
 and crack a whole continent. Everything persists until `clear()`.
