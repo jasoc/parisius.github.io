@@ -1,5 +1,5 @@
 // @ts-nocheck — imperative CesiumJS code (global `Cesium` from the CDN), kept untyped on purpose.
-import { Tool, fmtW } from './tools';
+import { Tool, canSilo, fmtW } from './tools';
 
 declare const Cesium: any;
 
@@ -349,6 +349,30 @@ function installCullPad(ts, engine) {
 }
 
 // ---------------------------------------------------------------------------
+// Live imagery alpha on 3D tiles. Cesium bakes every draped layer's alpha into the tile's uniforms when it builds
+// the draw commands, and ANY change to a tileset layer (add, remove, show, alpha) resets the draw commands of
+// every tile: all shaders rebuilt, a visible stutter. A layer tagged with __liveAlpha keeps a constant alpha
+// (0.999: != 1, so the shader takes the alpha uniform) while the uniform value itself is read from the getter
+// at every draw. Toggling it is then free. Patches ImageryPipelineStage (private API, checked on 1.146).
+// ---------------------------------------------------------------------------
+function installLiveImageryAlpha() {
+  const S = Cesium.ImageryPipelineStage;
+  if (!S || typeof S._createImageryUniforms !== 'function') return false;
+  if (S.__nukeLive) return true;
+  S.__nukeLive = true;
+  const orig = S._createImageryUniforms;
+  S._createImageryUniforms = function (inputs) {
+    const u = orig.apply(this, arguments);
+    inputs.forEach((inp, i) => {
+      const get = inp.imageryLayer?.__liveAlpha;
+      if (get && u.imageryTextureAlpha) Object.defineProperty(u.imageryTextureAlpha, i, { get, enumerable: true, configurable: true });
+    });
+    return u;
+  };
+  return true;
+}
+
+// ---------------------------------------------------------------------------
 // The engine
 // ---------------------------------------------------------------------------
 export class NukeEngine {
@@ -400,6 +424,8 @@ export class NukeEngine {
     camera.setView({ destination: Cesium.Cartesian3.fromDegrees(9.175, 45.43, 2500), orientation: { heading: Cesium.Math.toRadians(20), pitch: Cesium.Math.toRadians(-35), roll: 0 } });
     this.geocoder = new Cesium.IonGeocoderService({ scene, geocodeProviderType: Cesium.IonGeocodeProviderType.GOOGLE });
 
+    this.labLive = installLiveImageryAlpha();
+    this.ensureLabels();
     this.setupShader();
     this.setupPost();
     this.puffs = scene.primitives.add(new Cesium.BillboardCollection({ blendOption: Cesium.BlendOption.TRANSLUCENT }));
@@ -453,7 +479,7 @@ export class NukeEngine {
       this.scene.primitives.add(ts);
       this.scene.globe.show = false;
       this.tileset = ts;
-      if (this.labelsOn) this.setLabels(true);
+      this.setLabels(this.labelsOn); // loads borders & names on the tiles right away, shown or not
       this.ev.status('');
     } catch (e) {
       if (this.viewer.isDestroyed()) return;
@@ -826,7 +852,10 @@ export class NukeEngine {
               inout vec4 ck, inout vec4 ck2, inout vec2 ckXY, inout vec3 ckUp) {
         if (a.y <= 0.0) return;
         vec3 l = (M * vec4(pEC, 1.0)).xyz;
-        float d = length(l.xy), maxR = a.w * 1.15;
+        // dd.x < 0 (a wall bite): the frame's z is the wall's normal, NOT the vertical. length(l.xy) would ignore the
+        // distance along that normal and paint an endless strip of scorch and cracks across the ground behind the
+        // wall: there everything is measured in 3D, a sphere around the hit
+        float d = dd.x < 0.0 ? length(l) : length(l.xy), maxR = a.w * 1.15;
         if (d > maxR * 1.05) return;
         ck2.z = max(ck2.z, 1.0 - smoothstep(0.9 * a.w, 1.1 * a.w, d)); // this slot draws its own scar out to r1
         float d0 = d;
@@ -873,6 +902,7 @@ export class NukeEngine {
         // Only the strongest blast's field is kept (its precise local frame also carries the shared crack web).
         float gf = R > 0.0 ? 1.0 : 0.35 * (1.0 - smoothstep(Rfb, 4.0 * Rfb, e.w));
         float ci = gf * (1.0 - smoothstep(a.y, a.z, d)) * smoothstep(d, d + 0.1 * a.y + 1.0, a.x);
+        if (dd.x < 0.0) ci = 0.0; // radial / concentric ground cracks make no sense in a wall's frame
         if (ci > ck.x) {
           float ang = atan(l.y, l.x) / 6.2832 + 0.5, wl = vn(l.xy / (0.15 * a.y + 1.0) + dd.w);
           // radial cracks: hashed angular sectors (domain-warped), each running out to its own length
@@ -1077,6 +1107,11 @@ export class NukeEngine {
         d.axis = C3.magnitude(ax) > 1e-6 * R ? C3.normalize(ax, ax) : C3.negate(camera.rightWC, new C3()); // horizontal, ⟂ to P->camera
         d.p0 = camera.pitch;
         d.h0alt = Cesium.Cartographic.fromCartesian(camera.positionWC).height;
+        // the start pose is upright by definition, even if a little outside the limits orbitPose enforces
+        const n0 = Cesium.Ellipsoid.WGS84.geodeticSurfaceNormal(d.pos0, new C3());
+        d.minDn = Math.min(-Math.sin(Cesium.Math.toRadians(89.6)), C3.dot(d.dir0, n0) - 1e-6);
+        d.rollTol = Math.max(0.02, Math.abs(C3.dot(camera.rightWC, n0)) + 0.01);
+        d.elOk = d.el0;
       }
       this.drag = d;
       try { cv.setPointerCapture(e.pointerId); } catch {}
@@ -1101,32 +1136,23 @@ export class NukeEngine {
       // tilt range shrinks with altitude: from far away you cannot tilt the globe off screen
       const pMax = this.maxPitch(d.h0alt);
       const lo = Math.max(Cesium.Math.toRadians(3), d.el0 - Math.max(0, pMax - d.p0)), hi = Cesium.Math.toRadians(89.5);
-      const el = Cesium.Math.clamp(d.el0 + ty * (Math.PI / cv.clientHeight), Math.min(lo, d.el0), Math.max(hi, d.el0));
+      const elWant = Cesium.Math.clamp(d.el0 + ty * (Math.PI / cv.clientHeight), Math.min(lo, d.el0), Math.max(hi, d.el0));
       const az = tx * ((2 * Math.PI) / cv.clientWidth);
-      // elevation: about the horizontal axis through P; bearing: about P's vertical. Same rotation for position,
-      // direction and up: rigid, so the grabbed point stays exactly under the cursor
-      const q = Cesium.Quaternion.multiply(Cesium.Quaternion.fromAxisAngle(d.up, -az), Cesium.Quaternion.fromAxisAngle(d.axis, d.el0 - el), new Cesium.Quaternion());
-      const Rm = Cesium.Matrix3.fromQuaternion(q), rot = (v) => Cesium.Matrix3.multiplyByVector(Rm, v, new C3());
-      const pos = C3.add(d.P, rot(d.v0), new C3()), dir = rot(d.dir0), up = rot(d.up0);
-      // grabbed off-centre, that rotation also rolls the view. Turning the camera about its own ray to P leaves P on
-      // the same pixel, so pick the turn that makes the camera's right vector horizontal again (roll 0)
-      const u = C3.normalize(C3.subtract(d.P, pos, new C3()), new C3()), n = Cesium.Ellipsoid.WGS84.geodeticSurfaceNormal(pos, new C3());
-      const r = C3.cross(dir, up, new C3()), ur = C3.cross(u, r, new C3());
-      const A = C3.dot(r, n), B = C3.dot(ur, n), Cc = C3.dot(u, r) * C3.dot(u, n), K = A - Cc, R0 = Math.hypot(K, B);
-      if (R0 > 1e-9 && Math.abs(Cc / R0) <= 1) {
-        const phi = Math.atan2(B, K), w = Math.acos(-Cc / R0);
-        const turn = (th) => Cesium.Matrix3.fromQuaternion(Cesium.Quaternion.fromAxisAngle(u, th));
-        let best = null;
-        for (const th of [phi + w, phi - w]) {
-          const t = Cesium.Math.negativePiToPi(th), M = turn(t), up2 = Cesium.Matrix3.multiplyByVector(M, up, new C3());
-          if (C3.dot(up2, n) > 0 && (!best || Math.abs(t) < Math.abs(best.t))) best = { t, M, up2 };
-        }
-        if (best && Math.abs(best.t) < 1.2) { Cesium.Matrix3.multiplyByVector(best.M, dir, dir); C3.clone(best.up2, up); }
-      }
+      // the elevation limit above is about P, not about the camera: grabbed off-centre, the camera itself can swing
+      // past straight down (pitch < -90°) and the Earth turns upside down. Like Google Earth, the camera never goes
+      // past nadir and never rolls: an invalid pose is cut back (bisection) to the last upright one on the way
+      let ps = this.orbitPose(d, elWant, az);
+      if (!ps) {
+        let a = d.elOk ?? d.el0, b = elWant, good = this.orbitPose(d, a, az);
+        for (let i = 0; i < 16 && good; i++) { const m = (a + b) / 2, q = this.orbitPose(d, m, az); if (q) { a = m; good = q; } else b = m; }
+        ps = good;
+        if (ps) d.elOk = a;
+      } else d.elOk = elWant;
+      if (!ps) return; // nothing upright this way: stay where we are
       // write the vectors directly: setView converts them to heading/pitch/roll, which is degenerate looking
       // straight down (gimbal lock) and let P slip ~70 px from orbit
       camera.lookAtTransform(Cesium.Matrix4.IDENTITY);
-      C3.clone(pos, camera.position); C3.clone(dir, camera.direction); C3.clone(up, camera.up); C3.cross(dir, up, camera.right);
+      C3.clone(ps.pos, camera.position); C3.clone(ps.dir, camera.direction); C3.clone(ps.up, camera.up); C3.cross(ps.dir, ps.up, camera.right);
     });
     on(cv, 'pointerup', () => (this.drag = null));
     on(cv, 'pointercancel', () => (this.drag = null));
@@ -1164,6 +1190,49 @@ export class NukeEngine {
     });
     on(document, 'keyup', (e) => this.keys.delete(e.key));
     on(window, 'blur', () => this.keys.clear());
+  }
+
+  /**
+   * Camera pose of the middle-drag orbit at elevation `el` above the grabbed point and bearing `az` around it, with
+   * the roll taken back to 0; null if that pose is not upright (past straight down, or rolled).
+   */
+  private orbitPose(d, el, az) {
+    const C3 = Cesium.Cartesian3;
+    // elevation: about the horizontal axis through P; bearing: about P's vertical. Same rotation for position,
+    // direction and up: rigid, so the grabbed point stays exactly under the cursor
+    const q = Cesium.Quaternion.multiply(Cesium.Quaternion.fromAxisAngle(d.up, -az), Cesium.Quaternion.fromAxisAngle(d.axis, d.el0 - el), new Cesium.Quaternion());
+    const Rm = Cesium.Matrix3.fromQuaternion(q), rot = (v) => Cesium.Matrix3.multiplyByVector(Rm, v, new C3());
+    const pos = C3.add(d.P, rot(d.v0), new C3()), dir = rot(d.dir0), up = rot(d.up0);
+    // grabbed off-centre, that rotation also rolls the view. Turning the camera about its own ray to P leaves P on
+    // the same pixel, so pick the turn that makes the camera's right vector horizontal again (roll 0)
+    const u = C3.normalize(C3.subtract(d.P, pos, new C3()), new C3()), n = Cesium.Ellipsoid.WGS84.geodeticSurfaceNormal(pos, new C3());
+    const r = C3.cross(dir, up, new C3()), ur = C3.cross(u, r, new C3());
+    const A = C3.dot(r, n), B = C3.dot(ur, n), Cc = C3.dot(u, r) * C3.dot(u, n), K = A - Cc, R0 = Math.hypot(K, B);
+    if (R0 > 1e-9 && Math.abs(Cc / R0) <= 1) {
+      const phi = Math.atan2(B, K), w = Math.acos(-Cc / R0);
+      const turn = (th) => Cesium.Matrix3.fromQuaternion(Cesium.Quaternion.fromAxisAngle(u, th));
+      let best = null;
+      for (const th of [phi + w, phi - w]) {
+        const t = Cesium.Math.negativePiToPi(th), M = turn(t), up2 = Cesium.Matrix3.multiplyByVector(M, up, new C3());
+        if (C3.dot(up2, n) > 0 && (!best || Math.abs(t) < Math.abs(best.t))) best = { t, M, up2 };
+      }
+      if (best && Math.abs(best.t) < 1.2) { Cesium.Matrix3.multiplyByVector(best.M, dir, dir); C3.clone(best.up2, up); }
+    }
+    // upright: never looking past straight down (there up would point into the ground), never rolled
+    if (C3.dot(dir, n) < d.minDn || C3.dot(up, n) < -1e-4) return null;
+    if (Math.abs(C3.dot(C3.cross(dir, up, new C3()), n)) > d.rollTol) return null;
+    return { pos, dir, up };
+  }
+  /**
+   * Safety net: a camera that ended up upside down (past straight down, roll ~180°) is put back upright, keeping
+   * what is "up" on screen. Without it the next setView(..., roll: 0) (wheel zoom, re-centring) flips the Earth.
+   */
+  private keepUpright() {
+    const cam = this.camera;
+    if (this.drag || cam._currentFlight) return;
+    const roll = Cesium.Math.negativePiToPi(cam.roll);
+    if (Math.abs(roll) < Math.PI / 2) return;
+    cam.setView({ orientation: { heading: cam.heading + Math.PI, pitch: Math.max(cam.pitch, Cesium.Math.toRadians(-89.5)), roll: 0 } });
   }
 
   private flyAround(heading, pitch) {
@@ -1266,15 +1335,32 @@ export class NukeEngine {
     this.drag = null;
     this.camera.flyTo({ destination: Cesium.Cartesian3.fromRadians(c.longitude, c.latitude, h), orientation: { heading: 0, pitch: Cesium.Math.toRadians(-89.5), roll: 0 }, duration: 0.8 });
   }
+  /**
+   * Borders & names are loaded once, up front, on the globe and on the 3D tiles, and stay loaded: the toggle only
+   * changes their opacity (see installLiveImageryAlpha), so it never rebuilds the tile shaders.
+   */
   setLabels(on: boolean) {
     this.labelsOn = on;
+    this.ensureLabels();
+    if (this.labGlobe) this.labGlobe.show = on; // the globe is only the fallback (hidden under the 3D tiles): cheap
+    if (this.tileset && !this.labLive) { // no live alpha (Cesium changed): the old way, with its rebuild
+      if (this.labTiles) { this.tileset.imageryLayers.remove(this.labTiles); this.labTiles = null; }
+      if (on) this.labTiles = this.tileset.imageryLayers.addImageryProvider(this.labProvider());
+    }
+    this.poke();
+  }
+  private labLive = false;
+  private labProvider() {
     const url = 'https://services.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}';
-    const prov = () => new Cesium.UrlTemplateImageryProvider({ url, maximumLevel: 19, credit: 'Esri World Boundaries and Places' });
-    if (this.labGlobe) { this.viewer.imageryLayers.remove(this.labGlobe); this.labGlobe = null; }
-    if (this.labTiles && this.tileset) { this.tileset.imageryLayers.remove(this.labTiles); this.labTiles = null; }
-    if (!on) return;
-    this.labGlobe = this.viewer.imageryLayers.addImageryProvider(prov());
-    if (this.tileset) this.labTiles = this.tileset.imageryLayers.addImageryProvider(prov());
+    return new Cesium.UrlTemplateImageryProvider({ url, maximumLevel: 19, credit: 'Esri World Boundaries and Places' });
+  }
+  private ensureLabels() {
+    if (!this.labGlobe) { this.labGlobe = this.viewer.imageryLayers.addImageryProvider(this.labProvider()); this.labGlobe.show = this.labelsOn; }
+    if (this.tileset && !this.labTiles && this.labLive) {
+      const L = this.tileset.imageryLayers.addImageryProvider(this.labProvider());
+      L.alpha = 0.999; L.__liveAlpha = () => (this.labelsOn ? 1 : 0);
+      this.labTiles = L;
+    }
   }
   setSunHour(h: number) { this.sunHour = h; this.poke(); }
 
@@ -1335,7 +1421,7 @@ export class NukeEngine {
     const k = this.tool.kind;
     if (!this.armed) return this.ev.hint('Press D or ARM, then click the map');
     if (k === 'carpet') return this.ev.hint(this.lineStart ? 'Click the end of the line' : 'Click the start of the bombing line');
-    if (this.launchMode) return this.ev.hint(this.base ? 'Click a target · Alt+click moves the silo' : 'Launch mode: click where to place your silo');
+    if (this.silo) return this.ev.hint(this.base ? 'Click a target · Alt+click moves the silo' : 'Launch mode: click where to place your silo');
     if (k === 'railgun') return this.ev.hint(`Click to place a turret (${this.turrets.length}/4)`);
     if (k === 'ufo') return this.ev.hint(`Click to summon a UFO (${this.ufos.length}/4)`);
     if (k === 'wind') return this.ev.hint('Click where the wind should blow · Esc to disarm');
@@ -1352,7 +1438,7 @@ export class NukeEngine {
       const a = this.lineStart; this.cancelLine(); this.updateHint();
       return this.carpetBomb(a, p, w);
     }
-    if (this.launchMode) {
+    if (this.silo) {
       if (!this.base || alt) return this.setBase(p);
       if (w.kind === 'cruise') return this.fireCruise(p, w);
       return this.launch(p, w);
@@ -1365,8 +1451,8 @@ export class NukeEngine {
     switch (w.kind) {
       case 'duck': return this.dropDuck(p);
       case 'ufo': return this.spawnUfo(p);
-      case 'asteroid': case 'rod': return this.launchMode ? this.detonate(p, w) : this.fireFromSky(p, w);
-      case 'cruise': return this.launchMode ? this.smallBoom(p, 2.2 * Math.cbrt(w.W / 0.00045)) : this.fireCruise(p, w);
+      case 'asteroid': case 'rod': return this.fireFromSky(p, w);
+      case 'cruise': return this.silo ? this.smallBoom(p, 2.2 * Math.cbrt(w.W / 0.00045)) : this.fireCruise(p, w);
       case 'railgun': return this.placeTurret(p);
       default: return this.detonate(p, w);
     }
@@ -1450,6 +1536,7 @@ export class NukeEngine {
     const a = s.amp * Math.exp(-s.t * 2.2);
     if (a < 0.00005) { s.amp = 0; return; }
     s.v = (Math.random() - 0.5) * a; s.h = (Math.random() - 0.5) * a;
+    if (cam.pitch < -1.5) s.v = 0; // near straight down a vertical jolt could tip the camera past nadir
     cam.lookUp(s.v); cam.lookRight(s.h);
   }
 
@@ -2058,6 +2145,8 @@ export class NukeEngine {
 
   // ---- launch-from-silo mode: any payload can be delivered by a ballistic missile ----
   launchMode = false;
+  /** launch mode is on AND the selected tool can be fired from a silo (UFOs, wind, ducks... never are) */
+  get silo() { return this.launchMode && canSilo(this.tool); }
   setLaunchMode(on: boolean) {
     this.launchMode = on;
     if (!on) this.removeBase();
@@ -2104,7 +2193,7 @@ export class NukeEngine {
   private fireCruise(target, w) {
     const C3 = Cesium.Cartesian3, enu = Cesium.Transforms.eastNorthUpToFixedFrame(target);
     let start;
-    if (this.launchMode && this.base) start = this.base.pos;
+    if (this.silo && this.base) start = this.base.pos;
     else {
       const hd = this.camera.heading + Math.PI + (Math.random() - 0.5) * 0.5, R = 25000;
       start = Cesium.Matrix4.multiplyByPoint(enu, new C3(Math.sin(hd) * R, Math.cos(hd) * R, 0), new C3());
@@ -2402,7 +2491,7 @@ export class NukeEngine {
     const radii = this.previewRadii();
     this.previewEnts.rings.forEach((e, i) => (e.show = on && i < radii.length));
     this.previewEnts.dot.show = on;
-    this.previewEnts.arc.show = on && this.launchMode && !!this.base && this.tool.kind !== 'carpet';
+    this.previewEnts.arc.show = on && this.silo && !!this.base;
   }
 
   // ---- rubber duck ----
@@ -2500,6 +2589,7 @@ export class NukeEngine {
   private frame(dt) {
     this.applyShake(dt);
     this.handleKeys(dt);
+    this.keepUpright();
     this.applyZoom(dt);
     this.recenter(dt);
     this.updateSun();
@@ -2513,7 +2603,7 @@ export class NukeEngine {
     this.updateGusts(dt); this.updateFlyers(dt); this.updateBombs(dt); this.updateParticles(dt); this.updateChunks(dt); this.updateDucks(dt); this.updateTurrets(dt); this.updateUfos(dt); this.updatePlanes(dt);
     if (this.hoverPx && this.armed) { const h = this.pickWorld(this.hoverPx); if (h) this.hover = h; this.hoverPx = null; }
     // the cursor rests on a target: start its bare-earth heightmap now, the click will likely land there
-    if (this.armed && this.hover && this.tileset && !this.launchMode && !this.lineStart) {
+    if (this.armed && this.hover && this.tileset && !this.silo && !this.lineStart) {
       const hv = this.hoverRest;
       if (!hv || Cesium.Cartesian3.distance(hv.p, this.hover) > 25) this.hoverRest = { p: Cesium.Cartesian3.clone(this.hover), t: performance.now(), done: false };
       else if (!hv.done && performance.now() - hv.t > 350) { hv.done = true; this.prepFor(hv.p, this.tool); }

@@ -68,7 +68,10 @@ export const TOOLS: Tool[] = [
   ]),
 ];
 
-export const TOOL_GROUPS = [...new Set(TOOLS.map((x) => x.group))].map((g) => ({ name: g, tools: TOOLS.filter((x) => x.group === g) }));
+/** what a silo can fire: warheads and bombs (nukes, ballistic and cruise missiles, conventional bombs) */
+export const canSilo = (t: Tool) => t.kind === 'nuke' || t.kind === 'icbm' || t.kind === 'cruise';
+
+export const TOOL_GROUPS =[...new Set(TOOLS.map((x) => x.group))].map((g) => ({ name: g, tools: TOOLS.filter((x) => x.group === g) }));
 
 export function fmtW(W: number): string {
   if (W >= 1e6) return (W / 1e6).toLocaleString('en-US', { maximumFractionDigits: 0 }) + ' Gt';

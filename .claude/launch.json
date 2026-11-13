@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "site",
+      "runtimeExecutable": "C:/Users/paride.giunta/AppData/Local/Microsoft/WinGet/Packages/Schniz.fnm_Microsoft.Winget.Source_8wekyb3d8bbwe/fnm.exe",
+      "runtimeArgs": ["exec", "--using=v24.16.0", "node", "node_modules/@angular/cli/bin/ng.js", "serve", "--port", "4200"],
+      "port": 4200
+    }
+  ]
+}

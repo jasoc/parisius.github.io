@@ -104,6 +104,22 @@ header {
   }
   .sel-name { font: var(--mat-sys-title-small); }
   .sel-meta { font: var(--mat-sys-label-small); color: var(--mat-sys-primary); }
+  .sel-text { flex: 1; min-width: 0; }
+}
+// silo capability: a chip on the selected tool, a badge on the cards that can be launched
+.silo-chip {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 8px 2px 5px;
+  border-radius: 999px;
+  font: var(--mat-sys-label-small);
+  border: 1px solid var(--mat-sys-outline-variant);
+  color: var(--mat-sys-on-surface-variant);
+  mat-icon { font-size: 14px; width: 14px; height: 14px; }
+  &.on { background: #ffd23f; border-color: #ffd23f; color: #1b1f24; }
+  &.off { color: var(--mat-sys-error); border-color: currentColor; }
 }
 .sel-desc {
   margin: -2px 4px 0;
@@ -149,6 +165,19 @@ header {
   &::after { content: ''; position: absolute; inset: 0; background: currentColor; opacity: 0; transition: opacity 0.15s; }
   &:hover::after { opacity: 0.06; }
   &:active { transform: scale(0.97); }
+  .silo-badge {
+    position: absolute;
+    top: 3px;
+    right: 3px;
+    font-size: 12px;
+    width: 12px;
+    height: 12px;
+    opacity: 0.45;
+    &.on { opacity: 1; color: #e0a800; }
+  }
+  // launch mode on: what the silo cannot fire is dimmed (still selectable, it just works directly)
+  &.nosilo { opacity: 0.45; filter: grayscale(0.7); }
+  &.nosilo.sel { opacity: 0.8; }
   &.sel {
     background: var(--mat-sys-primary-container);
     color: var(--mat-sys-on-primary-container);
@@ -160,6 +189,7 @@ header {
 .opts mat-button-toggle-group { width: 100%; border-radius: 999px; }
 .opts mat-button-toggle { flex: 1; }
 .opts mat-icon { font-size: 18px; width: 18px; height: 18px; }
+.opts mat-button-toggle.idle mat-icon { opacity: 0.4; }
 
 .sun {
   display: flex;

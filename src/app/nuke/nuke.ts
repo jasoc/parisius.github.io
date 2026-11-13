@@ -11,7 +11,7 @@ import { loadCesium } from './cesium-loader';
 
 declare const ngDevMode: unknown;
 import { NukeEngine, SavedView, effects } from './engine';
-import { TOOLS, TOOL_GROUPS, Tool, fmtW } from './tools';
+import { TOOLS, TOOL_GROUPS, Tool, canSilo, fmtW } from './tools';
 
 interface Place { id: string; name: string; view: SavedView; thumb: string; }
 
@@ -35,6 +35,12 @@ export class Nuke {
 
   protected readonly groups = TOOL_GROUPS;
   protected readonly fmtW = fmtW;
+  protected readonly canSilo = canSilo;
+  protected readonly launchTip = computed(() => {
+    const t = this.tool();
+    if (!this.opts().includes('launch')) return 'Launch from a silo (M): bombs, missiles and nukes only';
+    return canSilo(t) ? 'Launching from your silo (M)' : `Silo on, but ${t.name} cannot be fired from it: it is used directly`;
+  });
   protected readonly loading = signal(true);
   protected readonly mobile = signal(matchMedia('(max-width: 760px)').matches);
   protected readonly panelOpen = signal(!matchMedia('(max-width: 760px)').matches);

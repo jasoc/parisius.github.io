@@ -29,6 +29,11 @@
         <div class="sel-name">{{ tool().name }}</div>
         <div class="sel-meta">{{ toolMeta() }}</div>
       </div>
+      @if (canSilo(tool())) {
+        <span class="silo-chip" [class.on]="has('launch')" matTooltip="Can be fired from a silo (launch mode, M)"><mat-icon>rocket_launch</mat-icon>{{ has('launch') ? 'From silo' : 'Silo-ready' }}</span>
+      } @else if (has('launch')) {
+        <span class="silo-chip off" matTooltip="This tool cannot be fired from a silo: it is used directly"><mat-icon>block</mat-icon>No silo</span>
+      }
     </div>
     <p class="sel-desc">{{ tool().desc }}</p>
 
@@ -37,7 +42,8 @@
         <div class="group">{{ g.name }}</div>
         <div class="grid">
           @for (t of g.tools; track t.id) {
-            <button type="button" class="card" [class.sel]="t.id === tool().id" (click)="pick(t)" [matTooltip]="t.desc" matTooltipShowDelay="500">
+            <button type="button" class="card" [class.sel]="t.id === tool().id" [class.nosilo]="has('launch') && !canSilo(t)" (click)="pick(t)" [matTooltip]="t.desc + (canSilo(t) ? ' · Can be launched from a silo.' : '')" matTooltipShowDelay="500">
+              @if (canSilo(t)) { <mat-icon class="silo-badge" [class.on]="has('launch')">rocket_launch</mat-icon> }
               <span class="ico">{{ t.icon }}</span>
               <span class="name">{{ t.name }}</span>
               @if (t.W) { <span class="y">{{ fmtW(t.W) }}</span> }
@@ -49,7 +55,7 @@
 
     <div class="opts">
       <mat-button-toggle-group multiple hideMultipleSelectionIndicator [value]="opts()" (change)="setOpts($event.value)" aria-label="Options">
-        <mat-button-toggle value="launch" matTooltip="Launch from a silo (M)"><mat-icon>rocket_launch</mat-icon></mat-button-toggle>
+        <mat-button-toggle value="launch" [class.idle]="has('launch') && !canSilo(tool())" [matTooltip]="launchTip()"><mat-icon>rocket_launch</mat-icon></mat-button-toggle>
         <mat-button-toggle value="chain" matTooltip="Chain reaction (K)"><mat-icon>link</mat-icon></mat-button-toggle>
         <mat-button-toggle value="rings" matTooltip="Damage radii"><mat-icon>track_changes</mat-icon></mat-button-toggle>
         <mat-button-toggle value="labels" matTooltip="Borders & names (L)"><mat-icon>map</mat-icon></mat-button-toggle>
@@ -59,7 +65,7 @@
 
     <div class="sun">
       <mat-icon>{{ sunIcon() }}</mat-icon>
-      <mat-slider min="0" max="24" step="0.25" matTooltip="Time of day (UTC): moves the sun, so the lit half of the globe">
+      <mat-slider min="0" max="24" step="0.25">
         <input matSliderThumb [value]="sunHour()" (input)="setSun(+$any($event.target).value)" />
       </mat-slider>
       <span class="time">{{ sunLabel() }}</span>
