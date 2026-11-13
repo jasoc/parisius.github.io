@@ -1,37 +1,26 @@
 <canvas #bg class="bg"></canvas>
 <div class="aurora"></div>
-<div class="grid"></div>
 
 <section class="hero">
   <div class="prompt fade" style="--d: 0">
     <span class="dollar">$</span> whoami
   </div>
 
-  <h1 class="fade" style="--d: 1">Hi, I'm <span class="name">Paride</span>.</h1>
-
-  <p class="lead fade" style="--d: 2">
-    I'm into <em>computers</em>, <em>space</em> and <em>food</em>.
-  </p>
+  <h1 class="fade" style="--d: 1" aria-label="Parisius" (mouseenter)="morph('Paride')" (mouseleave)="morph('Parisius')">
+    <span class="name" aria-hidden="true">@for (g of glyphs(); track $index) {<span class="g" [class.scr]="!g.done">{{ g.ch }}</span>}</span>&#8203;
+  </h1>
 
   <div class="typed fade" style="--d: 3">
     <span class="slashes">//</span> {{ typed() }}<span class="caret"></span>
   </div>
 
   <nav class="links fade" style="--d: 4">
-    <a href="https://github.com/jasoc" target="_blank" rel="noopener"><i><img src="resources/github.png" alt="" /></i>GitHub</a>
-    <a href="https://www.linkedin.com/in/paride-giunta-96264918b/" target="_blank" rel="noopener"><i><img src="resources/linkedin.png" alt="" /></i>LinkedIn</a>
-    <a href="https://www.instagram.com/_parisius_/" target="_blank" rel="noopener"><i><img src="resources/instagram.png" alt="" /></i>Instagram</a>
-    <a href="https://steamcommunity.com/id/jasoc/" target="_blank" rel="noopener"><i><img src="resources/steam.png" alt="" /></i>Steam</a>
-    <a href="resources/cv.pdf" target="_blank"><i><img src="resources/cv.png" alt="" /></i>CV</a>
-    <button type="button" class="lucky" [class.rolling]="rolling()" (click)="feelingLucky()" title="Opens a random link">
-      <span class="lucky-inner"><i><img src="resources/clover.png" alt="" /></i>I'm feeling lucky</span>
-    </button>
+    <a href="https://github.com/jasoc" target="_blank" rel="noopener">github</a>
+    <a href="https://www.linkedin.com/in/paride-giunta-96264918b/" target="_blank" rel="noopener">linkedin</a>
+    <a href="https://www.instagram.com/_parisius_/" target="_blank" rel="noopener">instagram</a>
+    <a href="https://steamcommunity.com/id/jasoc/" target="_blank" rel="noopener">steam</a>
+    <button type="button" class="lucky" [class.rolling]="rolling()" (click)="feelingLucky()" title="Opens a random link">i'm feeling lucky</button>
   </nav>
-
-  <a mat-stroked-button class="apps fade" style="--d: 5" routerLink="/apps">
-    Explore the apps
-    <mat-icon iconPositionEnd>arrow_forward</mat-icon>
-  </a>
 </section>
 
-<footer class="fade" style="--d: 6">parisius.dev · my personal zone in the IPv4 space 🌍</footer>
+<footer class="fade" style="--d: 6">parisius.dev</footer>

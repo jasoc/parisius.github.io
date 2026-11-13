@@ -1,15 +1,17 @@
 import { Component, DestroyRef, ElementRef, afterNextRender, inject, signal, viewChild } from '@angular/core';
-import { RouterLink } from '@angular/router';
-import { MatButtonModule } from '@angular/material/button';
-import { MatIconModule } from '@angular/material/icon';
-import { startNetwork } from './network';
+import { startRain } from './rain';
 
 const TAGLINES = [
-  'cloud & infrastructure engineer',
-  'linux · kubernetes · networks',
-  'probably staring at the stars right now',
-  '…or eating.',
+  '[REDACTED]',
+  'no further information available',
+  'you were not supposed to find this',
+  'connection terminated.',
 ];
+
+const ALIAS = 'Parisius';
+const NAME = 'Paride';
+const NOISE = '!<>-_/[]{}=+*^?#$%&01';
+const noise = () => NOISE[(Math.random() * NOISE.length) | 0];
 
 const LUCKY_LINKS = [
   'https://www.youtube.com/watch?v=dQw4w9WgXcQ',
@@ -36,19 +38,50 @@ const LUCKY_LINKS = [
 
 @Component({
   selector: 'app-landing',
-  imports: [RouterLink, MatButtonModule, MatIconModule],
   templateUrl: './landing.html',
   styleUrl: './landing.scss',
 })
 export class Landing {
   protected readonly typed = signal('');
   protected readonly rolling = signal(false);
+  protected readonly glyphs = signal<{ ch: string; done: boolean }[]>([]);
   private readonly canvas = viewChild.required<ElementRef<HTMLCanvasElement>>('bg');
   private readonly recent: number[] = [];
+  private nameTimer?: ReturnType<typeof setTimeout>;
+  private shown = ALIAS;
+
+  /** Scrambles the current word into `target`, letters locking in left to right. */
+  protected morph(target: string) {
+    if (target === this.shown) return;
+    this.shown = target;
+    clearTimeout(this.nameTimer);
+    if (matchMedia('(prefers-reduced-motion: reduce)').matches) {
+      this.glyphs.set([...target].map((ch) => ({ ch, done: true })));
+      return;
+    }
+    const from = this.glyphs().map((g) => g.ch);
+    const len = Math.max(from.length, target.length);
+    // the whole word breaks up almost at once, then letters settle left to right
+    const start = Array.from({ length: len }, () => Math.random() * 3);
+    const lock = start.map((_, i) => 5 + i * 1.6 + Math.random() * 3);
+    const end = Math.max(...lock);
+    let f = 0;
+    const step = () => {
+      const out: { ch: string; done: boolean }[] = [];
+      for (let i = 0; i < len; i++) {
+        if (f >= lock[i]) { if (i < target.length) out.push({ ch: target[i], done: true }); }
+        else if (f >= start[i]) out.push({ ch: noise(), done: false });
+        else if (i < from.length) out.push({ ch: from[i], done: true });
+      }
+      this.glyphs.set(out);
+      if (++f <= end + 1) this.nameTimer = setTimeout(step, 38);
+    };
+    step();
+  }
 
   constructor() {
     const destroy = inject(DestroyRef);
-    afterNextRender(() => destroy.onDestroy(startNetwork(this.canvas().nativeElement)));
+    afterNextRender(() => destroy.onDestroy(startRain(this.canvas().nativeElement)));
 
     // typewriter cycling through the taglines
     let line = 0, pos = 0, deleting = false;
@@ -69,6 +102,9 @@ export class Landing {
     };
     timer = setTimeout(tick, 900);
     destroy.onDestroy(() => clearTimeout(timer));
+
+    destroy.onDestroy(() => clearTimeout(this.nameTimer));
+    this.glyphs.set([...ALIAS].map((ch) => ({ ch, done: true })));
   }
 
   /** Picked at click time with a crypto RNG, never one of the last few. */
